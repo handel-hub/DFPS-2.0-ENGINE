@@ -1,0 +1,19 @@
+DB state model
+
+0 = queued
+1 = leased
+2 = acknowledged
+3 = processing
+4 = completed
+5 = failed
+
+
+UPDATE jobs
+SET status = 2,
+    acknowledged_at = now(),
+    last_updated = now(),
+    version = version + 1
+WHERE id = $1
+AND status = 1
+AND assigned_coordinator = $2
+RETURNING *;
