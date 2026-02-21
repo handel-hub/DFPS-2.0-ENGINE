@@ -6,7 +6,7 @@ class MetricTable {
         this.totalCoordinator=0
         this.alpha=alpha
         this.beta=beta
-        this.helper = {
+        this.strategies = {
                 cpu_ema: (input, current) => {
                     return this.alpha * input + (1 - this.alpha) * (current || 0);
                 },
@@ -41,8 +41,11 @@ class MetricTable {
     async #addToQueue(metric){
         metric.forEach(element => {
             const id =element.id
-            this.metricTable.set(id,element)
-            this.totalCoordinator++
+            if (!this.metricTable.has(id)) {
+                this.metricTable.set(id, element);
+                this.totalCoordinator++;
+            }
+            
         });
     }
     updates(id,updateData){
@@ -51,7 +54,7 @@ class MetricTable {
         for (const key of Object.keys(updateData)) {
                 const newValue=updateData[key]
                 const currentValue=metric[key]
-                const strategy=this.helper[key]
+                const strategy=this.strategies[key]
 
                 if (strategy) {
                     metric[key] = strategy(newValue, currentValue);
