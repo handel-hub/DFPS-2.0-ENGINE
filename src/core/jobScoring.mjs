@@ -82,3 +82,4 @@ class AdaptiveJobScoringEngine {
     }
 }
 
+//add job type field to the job or file table
