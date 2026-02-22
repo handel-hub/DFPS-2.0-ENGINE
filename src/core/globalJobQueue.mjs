@@ -94,7 +94,7 @@ class GlobalJobQueue {
                 flag=true
             }
         }
-        return [...this.jobScheduleQueue]
+        return structuredClone(this.scheduleQueue)
     }
 }
 
