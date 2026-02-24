@@ -99,7 +99,7 @@ class GlobalJobQueue {
 }
 
 
-
+export default GlobalJobQueue
 /* 
 ### 1. The Old `GlobalJobQueue` (What We Escaped)
 

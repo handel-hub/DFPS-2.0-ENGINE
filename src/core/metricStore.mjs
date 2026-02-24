@@ -79,3 +79,4 @@ class MetricTable {
     }
 }
 
+export default MetricTable

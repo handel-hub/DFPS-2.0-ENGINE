@@ -21,7 +21,7 @@ class AdaptiveJobScoringEngine {
     #refreshFileSnapshot(){
     if (typeof this.#snapshotFunction !== 'function'){}
 
-    const snapshot=this.snapshotFunction()
+    const snapshot=this.#snapshotFunction()
         for (const [key,data] of snapshot) {
             const weight=this.#calculateTypeWeight(data)
             this.#fileSnapshots.set(key,weight)
@@ -81,5 +81,5 @@ class AdaptiveJobScoringEngine {
         return scoredJobs.sort((a, b) => b[1].calculatedScore - a[1].calculatedScore);
     }
 }
-
+export default AdaptiveJobScoringEngine
 //add job type field to the job or file table
