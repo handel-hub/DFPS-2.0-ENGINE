@@ -1,173 +1,225 @@
-import {serialize,deserialize} from "v8";
+import { serialize, deserialize } from "v8";
+
 class Affinity {
+
     #numSegment;
     #segmentRange;
+
     #variance_penalty_lambda;
     #ema_alpha;
     #min_sample_threshold;
     #temporal_decay_tau_seconds;
+
     #prior_alpha;
     #prior_beta;
-    #adaptation_rate_rho
+    #adaptation_rate_rho;
+
     #dataStructure;
-    constructor(sizeSegmentation={},policyConfig={}) {
 
-        this.#numSegment=sizeSegmentation.numSegment;
-        this.#segmentRange=sizeSegmentation.segmentRange;
-        
-        this.#variance_penalty_lambda=policyConfig.variance_penalty_lambda||0.75;
-        this.#ema_alpha=policyConfig.ema_alpha||0.2;
-        this.#min_sample_threshold=policyConfig.min_sample_threshold||50;
-        this.#temporal_decay_tau_seconds=policyConfig.temporal_decay_tau_seconds||86400;
-        this.#prior_alpha=policyConfig.prior_alpha||2;
-        this.#prior_beta=policyConfig.prior_beta||2;
-        this.#adaptation_rate_rho=policyConfig.adaptation_rate_rho||0.02
-        
-        this.#dataStructure=new Map()
-        
-        this.#initialize()
+    constructor(sizeSegmentation = {}, policyConfig = {}) {
 
+        this.#numSegment = sizeSegmentation.numSegment;
+        this.#segmentRange = sizeSegmentation.segmentRange;
+
+        this.#variance_penalty_lambda = policyConfig.variance_penalty_lambda || 0.75;
+        this.#ema_alpha = policyConfig.ema_alpha || 0.2;
+
+        this.#min_sample_threshold = policyConfig.min_sample_threshold || 50;
+        this.#temporal_decay_tau_seconds = policyConfig.temporal_decay_tau_seconds || 86400;
+
+        this.#prior_alpha = policyConfig.prior_alpha || 2;
+        this.#prior_beta = policyConfig.prior_beta || 2;
+
+        this.#adaptation_rate_rho = policyConfig.adaptation_rate_rho || 0.02;
+
+        this.#dataStructure = new Map();
+
+        this.#initialize();
     }
-    #initialize(){
+
+    #initialize() {
         for (let index = 0; index < this.#numSegment; index++) {
-            const range=this.#segmentRange[index]
-            const rangeName=Object.keys(range)[0]
-            this.#dataStructure.set(rangeName,new Map())
+            const range = this.#segmentRange[index];
+            const rangeName = Object.keys(range)[0];
+            this.#dataStructure.set(rangeName, new Map());
         }
+    }
 
-    }
-    #varibles(){
-        return{
-            rawStats:{
-                time:0,
-                size:0,
-                successIndicator:0||1,
-                timeStamp:0,
-                totalS:0,
-                totalN:0
+    #variables() {
+        return {
+            rawStats: {
+                totalS: 0,          // lifetime success count
+                totalN: 0,          // lifetime total count
+                timestamp: 0        // last update time
             },
-            derived:{
-                emaTime:0,
-                deviation:0,
-                reliabiltySuccess:0,
-                reliabiltyTotal:0
+            derived: {
+                emaTime: 0,         // μ_k
+                deviation: 0,       // σ_k
+
+                smoothSuccess: 0,   // S̃_k
+                smoothTotal: 0      // Ñ_k
             },
-            result:0
-        }
+            result: 0
+        };
     }
-    #bucketSegment(size){
-        let bucket=''
-        this.#segmentRange.filter(elem=>{
-            const keys=Object.keys(elem)[0]
-            const min=elem[keys].min
-            const max=elem[keys].max
-            if (size>=min&&size<=max) {
-                bucket=keys
+
+    #bucketSegment(size) {
+        let bucket = '';
+        this.#segmentRange.forEach(elem => {
+            const key = Object.keys(elem)[0];
+            const min = elem[key].min;
+            const max = elem[key].max;
+
+            if (size >= min && size <= max) {
+                bucket = key;
             }
-        })
-        return bucket
-    }
-    #updateAffinity(id,value,pipeline){
-
-        const {time, size, successIndicator, timeStamp}=value
-
-        const bucket=this.#bucketSegment(size)
-        const pipelineSegment=this.#dataStructure.get(bucket)
-        if (!pipelineSegment.has(pipeline)) {
-            pipelineSegment.set(pipeline,new Map())
-        }
-        const lcSegment=pipelineSegment.get(pipeline)
-        if (!lcSegment.has(id)) {
-            const variables=this.#varibles()
-            lcSegment.set(id,variables)
-        }
-
-        const segment=lcSegment.get(id)
-        
-        const execution=this.#executionTime(size,time)
-        const emaExec=this.#emaExecution(execution,segment.derived.emaTime)
-        const emaDevi=this.#emaDeviation(execution,emaExec,segment.derived.deviation)
-        if (successIndicator===1){
-            const old=segment.rawStats.totalS
-            const current=segment.rawStats.totalS+1
-            const success=this.#emaSuccess(current,old)
-            segment.rawStats.totalS=current
-            segment.derived.reliabiltySuccess=success
-        }
-        const reliabiltyT=this.#emaTotal(segment.rawStats.totalN)
-        segment.derived.reliabiltyTotal+=1
-        segment.derived.emaTime=emaExec
-        segment.derived.deviation=emaDevi
-        segment.derived.reliabiltyTotal=reliabiltyT
-        
-        segment.rawStats.totalN+=1
-        segment.rawStats.size=size
-        segment.rawStats.time=time
-        segment.rawStats.successIndicator=successIndicator
-        segment.rawStats.timeStamp=timeStamp
-
-    }
-    runUpdateAffinty(value){
-        const id=value.id;
-        value.data.forEach(element => {
-            const pipeline=element.pipeline
-            const value=element.value
-            this.#updateAffinity(id,value,pipeline)
         });
+        return bucket;
+    }
 
+    #updateAffinity(id, value, pipeline) {
+
+        const { time, size, successIndicator, timestamp } = value;
+
+        const bucket = this.#bucketSegment(size);
+        const pipelineSegment = this.#dataStructure.get(bucket);
+
+        if (!pipelineSegment.has(pipeline)) {
+            pipelineSegment.set(pipeline, new Map());
+        }
+
+        const lcSegment = pipelineSegment.get(pipeline);
+
+        if (!lcSegment.has(id)) {
+            lcSegment.set(id, this.#variables());
+        }
+
+        const segment = lcSegment.get(id);
+
+        // ----------------------------
+        // PERFORMANCE (FAST TIMESCALE)
+        // ----------------------------
+
+        const execution = time / size; // x_k
+
+        const prevMu = segment.derived.emaTime;
+        const newMu =
+            (this.#ema_alpha * execution) +
+            ((1 - this.#ema_alpha) * prevMu); // μ_k
+
+        const deviationInput = Math.abs(execution - newMu);
+
+        const prevSigma = segment.derived.deviation;
+        const newSigma =
+            (this.#ema_alpha * deviationInput) +
+            ((1 - this.#ema_alpha) * prevSigma); // σ_k
+
+        segment.derived.emaTime = newMu;
+        segment.derived.deviation = newSigma;
+
+        // ----------------------------
+        // HYBRID RELIABILITY (MEDIUM)
+        // ----------------------------
+
+        segment.derived.smoothSuccess =
+            this.#adaptation_rate_rho * successIndicator +
+            (1 - this.#adaptation_rate_rho) * segment.derived.smoothSuccess; // S̃_k
+
+        segment.derived.smoothTotal =
+            this.#adaptation_rate_rho +
+            (1 - this.#adaptation_rate_rho) * segment.derived.smoothTotal; // Ñ_k
+
+        // ----------------------------
+        // LIFETIME STRUCTURAL STATS
+        // ----------------------------
+
+        if (successIndicator === 1) {
+            segment.rawStats.totalS += 1;
+        }
+
+        segment.rawStats.totalN += 1;
+        segment.rawStats.timestamp = timestamp;
     }
-    #executionTime(size,time){
-        return time/size
+
+    runUpdateAffinty(value) {
+        const id = value.id;
+
+        value.data.forEach(element => {
+            const pipeline = element.pipeline;
+            const val = element.value;
+            this.#updateAffinity(id, val, pipeline);
+        });
     }
-    #emaExecution(execution,old){
-        return (this.#ema_alpha*execution)+((1-this.#ema_alpha)*old)
+
+    // ----------------------------
+    // COMPONENTS
+    // ----------------------------
+
+    #performance(mu, sigma) {
+        return 1 / (mu + (this.#variance_penalty_lambda * sigma) + 1e-9);
+    }
+
+    #reliability(smoothS, smoothN) {
+        return (
+            (smoothS + this.#prior_alpha) /
+            (smoothN + this.#prior_alpha + this.#prior_beta)
+        );
+    }
+
+    #structuralConfidence(totalN, timestamp) {
+
+        const structural =
+            totalN / (totalN + this.#min_sample_threshold);
+
+        const deltaSeconds =
+            (Date.now() - timestamp) / 1000;
+
+        const temporal =
+            Math.exp(-deltaSeconds / this.#temporal_decay_tau_seconds);
+
+        return structural * temporal;
+    }
+
+    #calculateResult(segment) {
+
+        const P = this.#performance(
+            segment.derived.emaTime,
+            segment.derived.deviation
+        );
+
+        const R = this.#reliability(
+            segment.derived.smoothSuccess,
+            segment.derived.smoothTotal
+        );
+
+        const C = this.#structuralConfidence(
+            segment.rawStats.totalN,
+            segment.rawStats.timestamp
+        );
+
+        return P * R * C;
+    }
+    prunning(){
         
     }
-    #emaDeviation(execution,ema,old){
-        const absolute=Math.abs(execution-ema)
-        return this.#ema_alpha*absolute+((1-this.#ema_alpha)*old)
-    }
-    #emaSuccess(current,old){
-        return (this.#adaptation_rate_rho*current)+((1-this.#adaptation_rate_rho)*old)
-    }
-    #emaTotal(old){
-        return this.#adaptation_rate_rho+((1-this.#adaptation_rate_rho)*old)
-    }
-    #perf(emaTime,deviation){
-        return 1/(emaTime+(deviation*this.#variance_penalty_lambda)+0.0000001)
-    }
-    #reliabilty(s,n){
-        return (s+this.#prior_alpha)/(n+this.#prior_alpha+this.#prior_beta)
-    }
-    #structuralConfidence(totalN,timestamp){
-        const delta=(Date.now()-timestamp)
-        const temporalDecay=Math.exp(-delta/this.#temporal_decay_tau_seconds)
-        return (totalN/(totalN+this.#min_sample_threshold))*temporalDecay
-    }
-    #calculateResult(emaTime,deviation,s,n,totalN,timestamp){
-        return this.#perf(emaTime,deviation)*this.#reliabilty(s,n)*this.#structuralConfidence(totalN,timestamp)
-    }
-    getAffinity(){
-        for (let pipelines of this.#dataStructure.values()) {
-        for (let  ids of pipelines) {
-            for (let  data of ids) {
+    getAffinity() {
 
-                data.result=this.#calculateResult(
-                    data.derived.emaTime,
-                    data.derived.deviation,
-                    data.derived.reliabiltySuccess,
-                    data.derived.reliabiltyTotal,
-                    data.rawStats.totalN,
-                    data.rawStats.timestamp
-                )
+        for (let pipelines of this.#dataStructure.values()) {
+            for (let ids of pipelines.values()) {
+                for (let segment of ids.values()) {
+
+                    segment.result =
+                        this.#calculateResult(segment);
+
+                }
             }
         }
-    }
 
-
-        return deserialize(serialize(this.#dataStructure))
+        return deserialize(serialize(this.#dataStructure));
     }
 }
+
+export default Affinity;
 
 
 
