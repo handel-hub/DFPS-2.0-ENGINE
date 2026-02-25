@@ -15,6 +15,8 @@ class AdaptiveJobScoringEngine {
         this.#EPSILON=polcyConfig.EPSILON || 2;
         this.#N_MIN=polcyConfig.N_MIN || 50
         this.#fileSnapshots=new Map()
+
+        //connects to jobweight table
         this.#snapshotFunction=snapshotFunction
     }
 
@@ -27,8 +29,7 @@ class AdaptiveJobScoringEngine {
             this.#fileSnapshots.set(key,weight)
         }   
     }
-
-
+    
     #calculateTypeWeight(stats) {
         const { successCount, failCount, expectedTime, actualTimeEMA, totalSamples } = stats;
 
@@ -66,19 +67,33 @@ class AdaptiveJobScoringEngine {
 
 
     
-    scoreJobs(pendingJobs=[]){
-        this.#refreshFileSnapshot()
-        const scoredJobs = pendingJobs.map(([jobId, jobData]) => {
-            // Rebuild the tuple, calculating the score for the data portion
-            return [
-                jobId, 
-                {
-                    ...jobData,
-                    calculatedScore: this.#scoreJob(jobData) 
-                }
-            ]
-        });
-        return scoredJobs.sort((a, b) => b[1].calculatedScore - a[1].calculatedScore);
+    scoreJobs(pendingJobs = []) {
+        this.#refreshFileSnapshot();
+
+        const length = pendingJobs.length;
+        const shadowArray = new Array(length);
+
+        for (let i = 0; i < length; i++) {
+            const jobTuple = pendingJobs[i];
+            const score = this.#scoreJob(jobTuple[1]);
+
+            shadowArray[i] = [jobTuple, score];
+        }
+
+        shadowArray.sort((a, b) => b[1] - a[1]);
+
+        const sortedJobs = new Array(length);
+        
+        for (let i = 0; i < length; i++) {
+            const originalTuple = shadowArray[i][0];
+            const calculatedScore = shadowArray[i][1];
+
+            originalTuple[1].calculatedScore = calculatedScore;
+            
+            sortedJobs[i] = originalTuple;
+        }
+
+        return sortedJobs;
     }
 }
 export default AdaptiveJobScoringEngine

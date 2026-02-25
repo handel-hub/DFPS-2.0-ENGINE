@@ -1,5 +1,3 @@
-import { serialize, deserialize } from "v8";
-
 class Affinity {
 
     #numSegment;
@@ -200,58 +198,59 @@ class Affinity {
         return P * R * C;
     }
     prunning(){
-        
+
     }
-    getAffinity() {
+    getAffinity(pipeline, size, validNodeIds = []) {
+        const length = validNodeIds.length;
 
-        for (let pipelines of this.#dataStructure.values()) {
-            for (let ids of pipelines.values()) {
-                for (let segment of ids.values()) {
+        const results = new Array(length);
+        
+        const bucket = this.#bucketSegment(size);
+        const pipelineSegment = this.#dataStructure.get(bucket);
 
-                    segment.result =
-                        this.#calculateResult(segment);
-
-                }
+        if (!pipelineSegment || !pipelineSegment.has(pipeline)) {
+            const fallbackScore = this.#calculateFallback();
+            for (let i = 0; i < length; i++) {
+                results[i] = { id: validNodeIds[i], score: fallbackScore };
             }
+            return results;
         }
 
-        return deserialize(serialize(this.#dataStructure));
+        const lcSegment = pipelineSegment.get(pipeline);
+
+        for (let i = 0; i < length; i++) {
+            const nodeId = validNodeIds[i];
+            const segment = lcSegment.get(nodeId);
+
+            let finalScore;
+            if (segment) {
+
+                finalScore = this.#calculateResult(segment);
+            } else {
+
+                finalScore = this.#calculateFallback();
+            }
+
+            results[i] = { id: nodeId, score: finalScore };
+        }
+
+        results.sort((a, b) => b.score - a.score);
+
+        return results;
+    }
+
+
+    #calculateFallback() {
+        return 0.1; 
     }
 }
-
 export default Affinity;
 
 
 
-/* 
-    N= totalSamples
-    Nmin= min number for jobs per type
-    S=success Rate
 
-*/
 
-/* 
-{
-    "affinity": {
-        "performance": {
-        "variance_penalty_lambda": 0.75,
-        "ema_alpha": 0.2
-        },
-        "confidence": {
-        "min_sample_threshold": 50,
-        "temporal_decay_tau_seconds": 86400
-        },
-        "reliability": {
-        "prior_alpha": 2,
-        "prior_beta": 2,
-        "adaptation_rate_rho": 0.02
-        },
-        "redemption": {
-        "conservative_mode": true
-        }
-    }
-}
-*/
+
 
 /* 
 reanlyzing to restucture rare file buckets
