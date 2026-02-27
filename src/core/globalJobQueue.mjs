@@ -1,105 +1,200 @@
 class GlobalJobQueue {
-    constructor(writeFunction) {
-        this.globalJobQueue= new Map(),
-        this.structureChange=false,
-        this.jobScheduleQueue=[],
-        this.writeDbQueue=new Map()
-        this.deleteWriteJobs=false
-        this.writeFunction=writeFunction
+    constructor(writeFunction, numPriorities = 5) {
+        // MLFQ Stratification: Index 0 is Critical, Index 4 is Background
+        this.numPriorities = numPriorities;
+        this.priorityQueues = Array.from({ length: numPriorities }, () => new Map());
+        
+        this.writeDbQueue = new Map();
+        this.writeFunction = writeFunction;
+        this.deleteWriteJobs = false;
+
+        // V8 Memory Management: The Tombstone Threshold
+        this.tombstoneCount = 0;
+        this.TOMBSTONE_LIMIT = 20000;
+
+        // Aging Configuration (e.g., promote jobs waiting longer than 30s)
+        this.AGING_THRESHOLD_MS = 30000; 
     }
-    async fetch(fetchFunction,coordinatorId,limit){
-        const jobs=await fetchFunction(coordinatorId,limit)
-        this.#addToQueue(jobs)
+
+    async fetch(fetchFunction, coordinatorId, limit) {
+        // Fetch ordered jobs from dfps_db
+        const jobs = await fetchFunction(coordinatorId, limit);
+        this.#addToQueue(jobs);
     }
-    #addToQueue(jobs){
-        const data=jobs
-        data.forEach(element => {
-            const id =element.id
-            this.globalJobQueue.set(id,element)
+
+    #addToQueue(jobs) {
+        const now = Date.now();
+        jobs.forEach(job => {
+            const id = job.id;
+            // Default to lowest priority if none exists
+            const priority = job.priority !== undefined ? job.priority : (this.numPriorities - 1);
+            
+            // Stamp arrival time for the Aging Sweeper
+            if (!job.arrivalTime) job.arrivalTime = now;
+            
+            this.priorityQueues[priority].set(id, job);
         });
     }
-    update(id,updateData){
-        if(!this.globalJobQueue.has(id))return false
-        const job=this.globalJobQueue.get(id);
-        for (const key of Object.keys(updateData)) {
-            const value=updateData[key]
-            job[key]=value
+
+    #findJob(id) {
+        // O(1) lookup with a constant factor. Scans max 5 maps.
+        for (let i = 0; i < this.numPriorities; i++) {
+            if (this.priorityQueues[i].has(id)) {
+                return { job: this.priorityQueues[i].get(id), priority: i };
+            }
         }
-        this.#updateWriteQueue(id,updateData)
+        return null;
     }
-    #updateWriteQueue(id,updateData){
+
+    update(id, updateData) {
+        const found = this.#findJob(id);
+        if (!found) return false;
+
+        const { job } = found;
+        for (const key of Object.keys(updateData)) {
+            job[key] = updateData[key];
+        }
+        this.#updateWriteQueue(id, updateData);
+        return true;
+    }
+
+    #updateWriteQueue(id, updateData) {
         if (this.writeDbQueue.has(id)) {
-            const job=this.writeDbQueue.get(id);
+            const job = this.writeDbQueue.get(id);
             for (const key of Object.keys(updateData)) {
-                const value=updateData[key]
-                job[key]=value
+                job[key] = updateData[key];
             }
         } else {
-            this.writeDbQueue.set(id,updateData)
+            this.writeDbQueue.set(id, updateData);
         }
     }
-    getStatusAndCount(){
-        const result=[]
-        this.writeDbQueue.forEach((value,key)=>{
-            const data={
-                count:value.count,
-                status:value.status
-            }
 
-            result.push({[key]:data})
-        })
-        return result
+    getStatusAndCount() {
+        const result = [];
+        this.writeDbQueue.forEach((value, key) => {
+            const data = {
+                count: value.count,
+                status: value.status,
+                priority: value.priority // Helpful to track if promoted
+            };
+            result.push({ [key]: data });
+        });
+        return result;
     }
-    async write(del=false){
-        // to be when write function is completed
-        await this.writeFunction
-        let writeAck// jus mock for now write returns ack to ensure successful write before final deletion
-        if (del===true&writeAck) {
-            this.deleteWriteJobs=true
-        }
-    }
-    async deleteJobs(jobIds,del=false){
-        const jobs=jobIds
-        for (const job of jobs) {
-            this.globalJobQueue.delete(job)
-        }
-        await this.write(del)
-        if (del===true&&writeAck) {
-            for (const job of jobs) {
-                this.writeDbQueue.delete(job)
-            }
-        }
-    }
-    scheduleQueue(lastId,size,fromstart=false){
-        this.jobScheduleQueue.length=0
-        let count=0
-        const jobSize=size
-        let flag=false
-        if (fromstart===true) {
-            for (const [jobId,jobData] of this.globalJobQueue) {
-                if (count >= jobSize) break;
-                this.jobScheduleQueue.push(jobData);
-                count++;
 
-            }
-            return this.jobScheduleQueue
+    async write(del = false) {
+        let writeAck = await this.writeFunction(this.writeDbQueue);
+        
+        // Fixed bitwise typo (& to &&) and scoping issues
+        if (del === true && writeAck) {
+            this.deleteWriteJobs = true;
         }
-        for (const [jobId,jobData] of this.globalJobQueue) {
-            if (flag) {
-                if (count >= jobSize) break;
-                this.jobScheduleQueue.push(jobData);
-                count++;
-            }
-            if (jobId===lastId) {
-                flag=true
+        return writeAck;
+    }
+
+    async deleteJobs(jobIds, del = false) {
+        for (const id of jobIds) {
+            const found = this.#findJob(id);
+            if (found) {
+                this.priorityQueues[found.priority].delete(id);
+                this.tombstoneCount++;
             }
         }
-        return structuredClone(this.scheduleQueue)
+
+        const writeAck = await this.write(del);
+
+        if (del === true && writeAck) {
+            for (const id of jobIds) {
+                this.writeDbQueue.delete(id);
+            }
+        }
+
+        // Trigger Coordinated Sweep if threshold is breached
+        if (this.tombstoneCount >= this.TOMBSTONE_LIMIT) {
+            this.#compactMemory();
+        }
+    }
+
+    #compactMemory() {
+        // V8 Safe Double-Buffering: Create fresh maps, swap references
+        for (let i = 0; i < this.numPriorities; i++) {
+            const freshMap = new Map();
+            for (const [id, job] of this.priorityQueues[i]) {
+                freshMap.set(id, job);
+            }
+            this.priorityQueues[i] = freshMap;
+        }
+        this.tombstoneCount = 0; // Reset counter
+    }
+
+    /**
+     * The Dispatcher Feed
+     */
+/**
+     * The Dispatcher Feed
+     * Extracts strictly 'pending' jobs and transitions them to 'queued'
+     */
+    scheduleQueue(size) {
+        const dispatchQuota = [];
+        let count = 0;
+
+        for (let i = 0; i < this.numPriorities; i++) {
+            for (const [jobId, jobData] of this.priorityQueues[i]) {
+                if (count >= size) return dispatchQuota;
+
+                // 1. The Pending Filter
+                if (jobData.status === 'pending') {
+                    
+                    // 2. In-Memory State Mutation
+                    jobData.status = 'queued';
+                    
+                    // 3. Add to Dispatch Quota
+                    dispatchQuota.push(jobData);
+                    count++;
+
+                    // 4. Sync State to Database Writer
+                    this.#updateWriteQueue(jobId, { status: 'queued' });
+                }
+            }
+        }
+
+        return dispatchQuota; 
+    }
+
+    /**
+     * The Aging Sweeper
+     * Call this in a background setInterval (e.g., every 5 seconds)
+     */
+    promoteAgedJobs() {
+        const now = Date.now();
+        // Start from 1 (ignore priority 0 since it can't go higher)
+        for (let currentLevel = 1; currentLevel < this.numPriorities; currentLevel++) {
+            for (const [jobId, jobData] of this.priorityQueues[currentLevel]) {
+                
+                if (now - jobData.arrivalTime > this.AGING_THRESHOLD_MS) {
+                    const higherLevel = currentLevel - 1;
+                    
+                    // Physically move the job
+                    this.priorityQueues[currentLevel].delete(jobId);
+                    
+                    // Reset arrival time so it doesn't instantly promote again
+                    jobData.arrivalTime = now; 
+                    jobData.priority = higherLevel;
+                    
+                    // Insert at the back of the higher priority line (FCFS)
+                    this.priorityQueues[higherLevel].set(jobId, jobData);
+                    
+                    // Queue for dfps_db sync
+                    this.#updateWriteQueue(jobId, { priority: higherLevel }); 
+                    
+                    this.tombstoneCount++;
+                }
+            }
+        }
     }
 }
 
-
-export default GlobalJobQueue
+export default GlobalJobQueue;
 /* 
 ### 1. The Old `GlobalJobQueue` (What We Escaped)
 
