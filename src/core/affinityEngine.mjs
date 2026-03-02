@@ -94,9 +94,7 @@ class Affinity {
 
         const segment = lcSegment.get(id);
 
-        // ----------------------------
         // PERFORMANCE (FAST TIMESCALE)
-        // ----------------------------
 
         const execution = time / size; // x_k
 
@@ -115,9 +113,7 @@ class Affinity {
         segment.derived.emaTime = newMu;
         segment.derived.deviation = newSigma;
 
-        // ----------------------------
         // HYBRID RELIABILITY (MEDIUM)
-        // ----------------------------
 
         segment.derived.smoothSuccess =
             this.#adaptation_rate_rho * successIndicator +
@@ -127,9 +123,7 @@ class Affinity {
             this.#adaptation_rate_rho +
             (1 - this.#adaptation_rate_rho) * segment.derived.smoothTotal; // Ñ_k
 
-        // ----------------------------
         // LIFETIME STRUCTURAL STATS
-        // ----------------------------
 
         if (successIndicator === 1) {
             segment.rawStats.totalS += 1;
@@ -149,9 +143,7 @@ class Affinity {
         });
     }
 
-    // ----------------------------
     // COMPONENTS
-    // ----------------------------
 
     #performance(mu, sigma) {
         return 1 / (mu + (this.#variance_penalty_lambda * sigma) + 1e-9);
@@ -199,6 +191,23 @@ class Affinity {
     }
     prunning(){
 
+    }
+    getAffinityStage(stages=[],size,nodeId){
+        const length=stages.length
+
+        const result=new Array(length)
+
+        const bucket=this.#bucketSegment(size)
+        const pipelineSegment=this.#dataStructure.get(bucket)
+
+        for (let index = 0; index < result; index++) {
+            const pipeline=stages[index]
+            if (!pipelineSegment||!pipelineSegment.has(pipeline)) {
+                const fallbackScore=this.#calculateFallback()
+                ````````````````````````````````````````````````````````````````````````````````````
+            }
+
+        }
     }
     getAffinity(pipeline, size, validNodeIds = []) {
         const length = validNodeIds.length;

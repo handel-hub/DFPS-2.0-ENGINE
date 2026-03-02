@@ -81,8 +81,13 @@ class Dispatcher {
             const numValidNodes = validNodes.length;
 
             // Step B: Contextual Bids
-            // Fetch precise affinity scores for these specific valid nodes in O(V)
-            const affinities = affinityEngine.getAffinity(job.type, jobSize, validNodes);
+            // Fetch precise affinity scores for these specific valid nodes in O(V)////to be fixed  for pipeline
+            const affinities = affinityEngine.getAffinity(job.type, jobSize, validNodes);//////////////////////////REFACTOR
+            //  REFACTOR
+            // REFACTOR
+            // REFACTOR
+            // REFACTOR
+            // REFACTOR
             const bids = new Array(numValidNodes);
             let maxBid = -1;
             let bestNodeId = null;
