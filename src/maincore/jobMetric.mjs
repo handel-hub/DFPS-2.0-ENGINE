@@ -19,23 +19,23 @@ class JobStore {
     #deltaFloor;
 
     constructor(jobConfig = {}) {
-        this.#expansionAlpha = typeof jobConfig.ram_alpha === 'number' ? jobConfig.ram_alpha : 0.15;
-        this.#timeAlpha = typeof jobConfig.time_alpha === 'number' ? jobConfig.time_alpha : 0.2;
+        this.#expansionAlpha    = Number(jobConfig.ram_alpha ?? 0.15);
+        this.#timeAlpha         = Number(jobConfig.time_alpha ?? 0.2);
 
-        this.#gammaExpansion = typeof jobConfig.expansion_weights === 'number' ? jobConfig.expansion_weights : 1.0;
-        this.#gammaExplicitRam = typeof jobConfig.explicit_ram_weights === 'number' ? jobConfig.explicit_ram_weights : 0.001;
-        this.#gammaTime = typeof jobConfig.time_weights === 'number' ? jobConfig.time_weights : 0.1;
+        this.#gammaExpansion    = Number(jobConfig.expansion_weights ?? 1.0);
+        this.#gammaExplicitRam  = Number(jobConfig.explicit_ram_weights ?? 0.001);
+        this.#gammaTime         = Number(jobConfig.time_weights ?? 0.1);
 
-        this.#rhoMin = typeof jobConfig.rho_min === 'number' ? jobConfig.rho_min : 0.01;
-        this.#rhoMax = typeof jobConfig.rho_max === 'number' ? jobConfig.rho_max : 100;
-        this.#tauMin = typeof jobConfig.tau_min === 'number' ? jobConfig.tau_min : 0.01;
-        this.#tauMax = typeof jobConfig.tau_max === 'number' ? jobConfig.tau_max : 86400; // 1 day
+        this.#rhoMin            = Number(jobConfig.rho_min ?? 0.01);
+        this.#rhoMax            = Number(jobConfig.rho_max ?? 100);
+        this.#tauMin            = Number(jobConfig.tau_min ?? 0.01);
+        this.#tauMax            = Number(jobConfig.tau_max ?? 86400); // 1 day
 
-        this.#confidenceSamples = typeof jobConfig.confidence_samples === 'number' ? jobConfig.confidence_samples : 5;
-        this.#sigmoidK = typeof jobConfig.sigmoid_k === 'number' ? jobConfig.sigmoid_k : 0.5;
-        this.#softmaxTemp = typeof jobConfig.softmax_temp === 'number' ? jobConfig.softmax_temp : 1.0;
-        this.#dampingBeta = typeof jobConfig.damping_beta === 'number' ? jobConfig.damping_beta : 0.95;
-        this.#deltaFloor = typeof jobConfig.delta_floor === 'number' ? jobConfig.delta_floor : 1e-6;
+        this.#confidenceSamples = Number(jobConfig.confidence_samples ?? 5);
+        this.#sigmoidK          = Number(jobConfig.sigmoid_k ?? 0.5);
+        this.#softmaxTemp       = Number(jobConfig.softmax_temp ?? 1.0);
+        this.#dampingBeta       = Number(jobConfig.damping_beta ?? 0.95);
+        this.#deltaFloor        = Number(jobConfig.delta_floor ?? 1e-6);
 
         this.#store = new Map();
     }
@@ -150,7 +150,7 @@ class JobStore {
     getWeights(jobProfile) {
         const stages = jobProfile.stages || [];
         const raws = stages.map(s => {
-        const r = this.#computeStageRaw({ pipelineId: jobProfile.pipelineId, extension: s.extension, explicitRamMB: s.ramMB });
+        const r = this.#computeStageRaw({ pipelineId: s.pipelineId, extension: s.extension, explicitRamMB: s.ramMB });
         return r.raw;
         });
 

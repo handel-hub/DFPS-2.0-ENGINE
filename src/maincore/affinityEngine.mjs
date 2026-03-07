@@ -192,10 +192,11 @@ class Affinity {
     prunning(){
 
     }
-    getAffinityStage(stages=[],size,nodeId){
-        const length=stages.length
+    getAffinityStage(stages=[],size,validNodeIds=[]){
+        const totalStages=stages.length
+        const totalNodes=validNodeIds.length
 
-        const result=new Array(length)
+        const result=new Array(totalNodes)
 
         const bucket=this.#bucketSegment(size)
         const pipelineSegment=this.#dataStructure.get(bucket)
@@ -204,7 +205,7 @@ class Affinity {
             const pipeline=stages[index]
             if (!pipelineSegment||!pipelineSegment.has(pipeline)) {
                 const fallbackScore=this.#calculateFallback()
-                ````````````````````````````````````````````````````````````````````````````````````
+                
             }
 
         }

@@ -1,4 +1,6 @@
-//add job type field to the job or file table
+//
+// SINCE ALL JOBS ARE FILES REFACTOR TO ONLY USE 
+// EXTENSIONS THEN REFACTOR INTERFACE
 
 
 class AdaptiveJobScoringEngine {
@@ -9,6 +11,7 @@ class AdaptiveJobScoringEngine {
     #N_MIN;
     #W_MAX;
     #W_MIN;
+    #BASE_STREAM_RAM;
     #BASE_STREAM_RAM_MB;
     #EXPANSION_MULTIPLIER;
     #STAGE_COMPLEXITY_MODIFIER;
@@ -23,8 +26,8 @@ class AdaptiveJobScoringEngine {
         this.#EPSILON = Number(policyConfig.EPSILON ?? 2);
         this.#N_MIN = Number(policyConfig.N_MIN ?? 50);
 
-        const baseStreamRamBytes = Number(policyConfig.BASE_STREAM_RAM ?? (250 * 1024 * 1024));
-        this.#BASE_STREAM_RAM_MB = Math.max(0.1, baseStreamRamBytes / this.#BYTES_PER_MB);
+        this.#BASE_STREAM_RAM = Number(policyConfig.BASE_STREAM_RAM ?? (250 * 1024 * 1024));
+        this.#BASE_STREAM_RAM_MB = Math.max(0.1, this.#BASE_STREAM_RAM / this.#BYTES_PER_MB);
         this.#EXPANSION_MULTIPLIER = Number(policyConfig.EXPANSION_MULTIPLIER ?? 3.0);
         this.#STAGE_COMPLEXITY_MODIFIER = Number(policyConfig.STAGE_COMPLEXITY_MODIFIER ?? 0.05);
 
