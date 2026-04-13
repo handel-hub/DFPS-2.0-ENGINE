@@ -12,6 +12,8 @@
   "type": "commonjs",
   "dependencies": {
     "@grpc/grpc-js": "^1.14.3",
-    "@grpc/proto-loader": "^0.8.0"
+    "@grpc/proto-loader": "^0.8.0",
+    "dotenv": "^17.4.1",
+    "piscina": "^5.1.4"
   }
 }
