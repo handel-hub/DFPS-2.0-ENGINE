@@ -1,4 +1,4 @@
-import SlotManager from "./slotManager.mjs"; // adjust path if needed
+import SlotManager from "../src/pool-managers/slotManager.mjs"; // adjust path if needed
 
 // Simulate worker IDs
 let workerCounter = 0;
