@@ -49,7 +49,7 @@ class Register {
             'IDLE': ['BUSY', 'WARM', 'TERMINATING'],
             'BUSY': ['IDLE', 'TERMINATING'],
             'WARM': ['IDLE', 'TERMINATING'],
-            'TERMINATING': ['DEAD', 'IDLE'] // Added IDLE for recovery path
+            'TERMINATING': ['DEAD', 'IDLE']
         };
         return transitions[worker.state]?.includes(targetState) ?? false;
     }
@@ -57,31 +57,35 @@ class Register {
     // --- Core Operations ---
 
     createWorkerRecord(workerRecord) {
-        if (!workerRecord.workerId || !workerRecord.pluginId || workerRecord.slotId === undefined) {
+        const { workerId, pluginId, slotId } = workerRecord;
+        
+        // Issue 3 fix: Explicit whitelisting/validation
+        if (!workerId || !pluginId || slotId === undefined) {
             throw new Error('Incomplete worker record: workerId, pluginId, and slotId are required');
         }
-        if (this.#registry.has(workerRecord.workerId)) {
-            throw new Error(`Worker ${workerRecord.workerId} already exists`);
+        if (this.#registry.has(workerId)) {
+            throw new Error(`Worker ${workerId} already exists`);
         }
 
-        // Slot occupancy invariant check
-        const occupants = this.#slotIndex.get(workerRecord.slotId);
+        const occupants = this.#slotIndex.get(slotId);
         if (occupants && occupants.size > 0) {
-            throw new Error(`Slot ${workerRecord.slotId} already occupied`);
+            throw new Error(`Slot ${slotId} already occupied`);
         }
 
         const record = {
-            ...workerRecord,
+            workerId,
+            pluginId,
+            slotId,
             state: 'CREATED',
             createdAt: Date.now(),
             lastUsedAt: Date.now(),
             metadata: {} 
         };
 
-        this.#registry.set(record.workerId, record);
-        this.#addToIndex(this.#pluginIndex, record.pluginId, record.workerId);
-        this.#addToIndex(this.#stateIndex, record.state, record.workerId);
-        this.#addToIndex(this.#slotIndex, record.slotId, record.workerId);
+        this.#registry.set(workerId, record);
+        this.#addToIndex(this.#pluginIndex, pluginId, workerId);
+        this.#addToIndex(this.#stateIndex, record.state, workerId);
+        this.#addToIndex(this.#slotIndex, slotId, workerId);
         
         return true;
     }
@@ -91,7 +95,11 @@ class Register {
         
         if (!worker) throw new Error(`Worker ${workerId} not found`);
         if (!this.#statesList.includes(newState)) throw new Error(`Invalid state: ${newState}`);
-        if (!this.#allowedTransition(newState, worker)) return false;
+        
+        // Issue 1 fix: Throw instead of return false for unified error signaling
+        if (!this.#allowedTransition(newState, worker)) {
+            throw new Error(`Invalid transition for Worker ${workerId}: ${worker.state} -> ${newState}`);
+        }
 
         const oldState = worker.state;
         this.#removeFromIndex(this.#stateIndex, oldState, workerId);
@@ -102,9 +110,17 @@ class Register {
         }
 
         worker.state = newState;
-        worker.lastUsedAt = Date.now(); // Universal time tracking
-        this.#addToIndex(this.#stateIndex, newState, workerId);
+        worker.lastUsedAt = Date.now();
 
+        // Issue 2 fix: Core-level timestamp management
+        if (newState === 'BUSY') {
+            worker.metadata.assignedAt = Date.now();
+        } else if (oldState === 'BUSY') {
+            // Issue 4 fix: Delete key instead of setting undefined
+            delete worker.metadata.assignedAt;
+        }
+
+        this.#addToIndex(this.#stateIndex, newState, workerId);
         return true;
     }
 
@@ -122,51 +138,33 @@ class Register {
             this.#removeFromIndex(this.#slotIndex, oldSlotId, workerId);
             this.#addToIndex(this.#slotIndex, newSlotId, workerId);
             worker.slotId = newSlotId;
-            worker.metadata = { 
-                ...worker.metadata, 
-                previousSlotId: oldSlotId, 
-                slotMovedAt: Date.now() 
-            };
+            worker.metadata.previousSlotId = oldSlotId;
+            worker.metadata.slotMovedAt = Date.now();
         }
         return true;
     }
 
     // --- Internal API Mechanics ---
 
-    markReady(workerId) { return this.updateState(workerId, 'IDLE'); }
-    
-    assignWork(workerId, taskData = {}) {
-        const success = this.updateState(workerId, 'BUSY');
-        if (success) {
-            const worker = this.#registry.get(workerId);
-            worker.metadata = { ...worker.metadata, ...taskData, assignedAt: Date.now() };
-        }
-        return success;
+    markReady(id)    { return this.updateState(id, 'IDLE'); }
+    markWarm(id)     { return this.updateState(id, 'WARM'); }
+    promoteWarm(id)  { return this.updateState(id, 'IDLE'); }
+    terminate(id)    { return this.updateState(id, 'TERMINATING'); }
+    markDead(id)     { return this.updateState(id, 'DEAD'); }
+
+    assignWork(id, taskData = {}) {
+        this.updateState(id, 'BUSY'); // Throws if invalid
+        const { assignedAt, ...safeTaskData } = taskData;
+        const worker = this.#registry.get(id);
+        worker.metadata = { ...worker.metadata, ...safeTaskData };
+        return true;
     }
 
-    completeWork(workerId) {
-        const success = this.updateState(workerId, 'IDLE');
-        if (success) {
-            const worker = this.#registry.get(workerId);
-            worker.metadata = { 
-                ...worker.metadata, 
-                lastCompletedAt: Date.now(),
-                assignedAt: undefined 
-            };
-        }
-        return success;
-    }
-
-    markWarm(workerId)    { return this.updateState(workerId, 'WARM'); }
-    promoteWarm(workerId) { return this.updateState(workerId, 'IDLE'); }
-    terminate(workerId)   { return this.updateState(workerId, 'TERMINATING'); }
-    
-    markDead(workerId) { 
-        const worker = this.#registry.get(workerId);
-        if (worker && !['TERMINATING', 'STARTING', 'CREATED'].includes(worker.state)) {
-            throw new Error(`Worker must be in TERMINATING or initial state to mark as DEAD`);
-        }
-        return this.updateState(workerId, 'DEAD'); 
+    completeWork(id) {
+        this.updateState(id, 'IDLE'); // Throws if invalid
+        const worker = this.#registry.get(id);
+        worker.metadata.lastCompletedAt = Date.now();
+        return true;
     }
 
     // --- Monitoring & Read APIs ---
@@ -187,16 +185,6 @@ class Register {
         return result;
     }
 
-    getWorkersByState(state) {
-        const ids = this.#stateIndex.get(state);
-        return ids ? Array.from(ids).map(id => this.getWorker(id)) : [];
-    }
-
-    getWorkersByPlugin(pluginId) {
-        const ids = this.#pluginIndex.get(pluginId);
-        return ids ? Array.from(ids).map(id => this.getWorker(id)) : [];
-    }
-
     getStalledWorkers(timeoutMs) {
         const now = Date.now();
         const busyIds = this.#stateIndex.get('BUSY');
@@ -204,16 +192,11 @@ class Register {
 
         return Array.from(busyIds)
             .map(id => this.#registry.get(id))
-            .filter(w => {
-                const startTime = typeof w.metadata?.assignedAt === 'number' 
-                    ? w.metadata.assignedAt 
-                    : w.lastUsedAt;
-                return (now - startTime) > timeoutMs;
-            })
+            .filter(w => (now - w.metadata.assignedAt) > timeoutMs)
             .map(w => this.getWorker(w.workerId));
     }
 
-    #clear() {
+    clear() {
         this.#registry.clear();
         this.#pluginIndex.clear();
         this.#stateIndex.clear();
