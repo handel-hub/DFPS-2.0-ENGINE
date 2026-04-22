@@ -1,3 +1,4 @@
+
 class MemoryController {
     constructor(config = {}) {
         this.safetyMarginMB = config.safetyMarginMB ?? 512;
@@ -135,3 +136,5 @@ class MemoryController {
         };
     }
 }
+
+export default MemoryController

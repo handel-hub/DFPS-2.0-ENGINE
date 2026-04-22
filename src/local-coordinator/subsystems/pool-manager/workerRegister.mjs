@@ -203,3 +203,5 @@ class Register {
         this.#slotIndex.clear();
     }
 }
+
+export default Register

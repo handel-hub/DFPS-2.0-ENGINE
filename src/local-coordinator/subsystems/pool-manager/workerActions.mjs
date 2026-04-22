@@ -310,7 +310,6 @@ class WorkerActions extends EventEmitter {
     
 }
 
-export default WorkerActions
 
 class ProjectError extends Error {
     constructor(message, options = {}) {
@@ -348,3 +347,6 @@ function logError(err) {
     console.error(report);
 
 }
+
+
+export { WorkerActions, ProjectError, logError };
