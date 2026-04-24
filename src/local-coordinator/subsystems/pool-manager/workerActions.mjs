@@ -213,7 +213,7 @@ class WorkerActions extends EventEmitter {
         console.log(`[Cleanup] Resources for ${workerId} purged.`);
     }
 
-        kill(workerId, timeout = 5000) {
+    kill(workerId, timeout = 5000) {
         const entry = this.#data.get(workerId);
         if (!entry) {
             return new ProjectError("Worker ID not found in Pool", { workerId, code: 'NOT_FOUND' });
