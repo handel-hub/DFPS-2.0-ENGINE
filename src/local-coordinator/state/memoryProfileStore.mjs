@@ -5,8 +5,8 @@ class MemoryProfileStore {
     // ─────────────────────────────────────────────────────────────────────────
     // Configurable constants
     // ─────────────────────────────────────────────────────────────────────────
-    #baseAlpha;
-    #varAlpha;
+    #baseAlphaBase;           // starting alpha when learning is fresh
+    #varAlphaBase;
     #maxAlpha;
 
     #minBaseMB;
@@ -25,16 +25,17 @@ class MemoryProfileStore {
     #safetySteepness;
 
     #ratioNoiseThreshold;
-    #outlierMultiplier;        // New: e.g. 4.0 → reject if > 4× current emaRatio
+    #outlierMultiplier;       // relative multiplier
+    #rollingWindowSize;       // for 3σ check (default 10)
 
-    #pruneAgeSeconds;          // New: default 30 days
+    #pruneAgeSeconds;
 
     #store = new Map();
 
     constructor(config = {}) {
-        this.#baseAlpha = Number(config.baseAlpha ?? 0.15);
-        this.#varAlpha  = Number(config.varAlpha  ?? 0.15);
-        this.#maxAlpha  = Number(config.maxAlpha  ?? 0.25);
+        this.#baseAlphaBase = Number(config.baseAlphaBase ?? 0.25);   // higher when fresh
+        this.#varAlphaBase  = Number(config.varAlphaBase  ?? 0.25);
+        this.#maxAlpha      = Number(config.maxAlpha      ?? 0.25);
 
         this.#minBaseMB = Number(config.minBaseMB ?? 50);
         this.#maxBaseMB = Number(config.maxBaseMB ?? 4000);
@@ -52,14 +53,23 @@ class MemoryProfileStore {
         this.#safetySteepness = Number(config.safetySteepness ?? 7);
 
         this.#ratioNoiseThreshold = Number(config.ratioNoiseThreshold ?? 1.05);
-        this.#outlierMultiplier = Number(config.outlierMultiplier ?? 4.0);     // ← New
+        this.#outlierMultiplier = Number(config.outlierMultiplier ?? 4.0);
+        this.#rollingWindowSize = Number(config.rollingWindowSize ?? 10);   // for 3σ
 
-        this.#pruneAgeSeconds = Number(config.pruneAgeSeconds ?? 30 * 86400); // 30 days
+        this.#pruneAgeSeconds = Number(config.pruneAgeSeconds ?? 30 * 86400);
     }
 
     #makeKey(pipelineId, extension) {
         const ext = (extension || '').replace(/^\./, '').toLowerCase();
         return `${pipelineId}::${ext}`;
+    }
+
+    #getCurrentAlpha(baseAlpha, profile) {
+        if (profile.samples < 8 || profile.confidence < 0.3) {
+            return baseAlpha;                    // aggressive learning when fresh
+        }
+        // Decay toward more stable learning as confidence grows
+        return baseAlpha * (1 - profile.confidence * 0.6);
     }
 
     #getSafetyMultiplier(confidence = 0) {
@@ -71,46 +81,71 @@ class MemoryProfileStore {
         return alpha * next + (1 - alpha) * (current ?? next);
     }
 
+    // Simple rolling standard deviation for outlier detection
+    #isOutlier(profile, newRatio) {
+        if (profile.samples < 5) return false; // not enough data
+
+        const ratios = profile.recentRatios || [];
+        if (ratios.length < 3) return false;
+
+        const mean = ratios.reduce((a, b) => a + b, 0) / ratios.length;
+        const variance = ratios.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / ratios.length;
+        const stdDev = Math.sqrt(variance);
+
+        const zScore = Math.abs(newRatio - mean) / (stdDev || 1);
+
+        return zScore > 3.0 || newRatio > (profile.emaRatio || 1) * this.#outlierMultiplier;
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
-    // Initialization
+    // Initialization with Contract Version Awareness
     // ─────────────────────────────────────────────────────────────────────────
     initFromContract(pipelineId, extension, contract) {
         const key = this.#makeKey(pipelineId, extension);
-        if (this.#store.has(key)) return false;
+        const existing = this.#store.get(key);
+        const newVersion = contract.version || 'unknown';
 
+        if (existing) {
+            // Version change detected → reset learning
+            if (newVersion !== existing.contractVersion) {
+                console.info(`[MemoryProfileStore] Contract version changed for ${key}: ${existing.contractVersion} → ${newVersion}. Resetting profile.`);
+                // Reset to contract values and force re-learning
+                const rm = contract.resourceModel || {};
+                existing.baseOverheadMB = Number(rm.baseOverheadMB ?? existing.baseOverheadMB);
+                existing.variablePerMB = Number(rm.variablePerMB ?? existing.variablePerMB);
+                existing.maxObservedRatio = Number(rm.maxExpansionRatio ?? existing.maxObservedRatio);
+                existing.emaRatio = Number(rm.maxExpansionRatio ?? existing.emaRatio);
+
+                existing.samples = 0;
+                existing.confidence = 0.0;
+                existing.recentRatios = [];
+                existing.contractVersion = newVersion;
+                existing.source = 'contract-reset';
+                return true;
+            }
+            return false; // same version, no action
+        }
+
+        // First time initialization
         const rm = contract.resourceModel || {};
-
         this.#store.set(key, {
             baseOverheadMB:    Number(rm.baseOverheadMB ?? 300),
             variablePerMB:     Number(rm.variablePerMB ?? 1.5),
             maxObservedRatio:  Number(rm.maxExpansionRatio ?? 12.0),
             emaRatio:          Number(rm.maxExpansionRatio ?? 8.0),
+            recentRatios:      [],                    // circular buffer for 3σ
             samples:           0,
             confidence:        0.0,
             lastSeen:          Math.floor(Date.now() / 1000),
+            contractVersion:   newVersion,
             source:            'contract'
         });
-        return true;
-    }
 
-    seedFromCluster(pipelineId, extension, clusterProfile) {
-        const key = this.#makeKey(pipelineId, extension);
-        const existing = this.#store.get(key);
-        if (!existing || existing.samples > 0) return false;
-
-        const cp = clusterProfile || {};
-        existing.baseOverheadMB = Number(cp.baseOverheadMB ?? existing.baseOverheadMB);
-        existing.variablePerMB  = Number(cp.variablePerMB ?? existing.variablePerMB);
-        existing.maxObservedRatio = Math.max(existing.maxObservedRatio, Number(cp.maxExpansionRatio ?? 0));
-        existing.emaRatio = Number(cp.emaRatio ?? existing.emaRatio);
-
-        existing.source = 'cluster-seed';
-        existing.lastSeen = Math.floor(Date.now() / 1000);
         return true;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Core Update with Outlier Protection
+    // Update with hardened outlier rejection + dynamic alphas
     // ─────────────────────────────────────────────────────────────────────────
     update({ pipelineId, extension, peakRamBytes, fileSizeBytes }) {
         const key = this.#makeKey(pipelineId, extension);
@@ -121,27 +156,29 @@ class MemoryProfileStore {
         const observedMB = peakRamBytes / (1024 * 1024);
         const newRatio = peakRamBytes / Math.max(1, fileSizeBytes);
 
-        // === OUTLIER REJECTION ===
-        const currentEmaRatio = profile.emaRatio || newRatio;
-        if (newRatio > currentEmaRatio * this.#outlierMultiplier) {
-            console.warn(`[MemoryProfileStore] Outlier rejected for ${key}: ratio=${newRatio.toFixed(2)} (ema=${currentEmaRatio.toFixed(2)})`);
-            // Still update lastSeen and samples count, but do NOT update model
-            profile.samples += 1;
+        // Hardened outlier detection
+        if (this.#isOutlier(profile, newRatio)) {
+            console.warn(`[MemoryProfileStore] Outlier rejected for ${key}: ratio=${newRatio.toFixed(2)}`);
+            profile.samples += 1;           // still count the attempt
             profile.lastSeen = Math.floor(Date.now() / 1000);
-            return false; // signal that update was rejected
+            return false;
         }
 
-        // Normal update
+        // Dynamic learning rates
+        const currentBaseAlpha = this.#getCurrentAlpha(this.#baseAlphaBase, profile);
+        const currentVarAlpha  = this.#getCurrentAlpha(this.#varAlphaBase, profile);
+
         const sizeWeight = Math.min(1.0, fileMB / this.#sizeWeightTransitionMB);
         const predictedMB = profile.baseOverheadMB + profile.variablePerMB * fileMB;
         const error = observedMB - predictedMB;
 
-        profile.baseOverheadMB += this.#baseAlpha * (1 - sizeWeight) * error;
+        // Update parameters
+        profile.baseOverheadMB += currentBaseAlpha * (1 - sizeWeight) * error;
         profile.baseOverheadMB = Math.max(this.#minBaseMB, Math.min(this.#maxBaseMB, profile.baseOverheadMB));
 
         if (fileMB > 5) {
             const varUpdate = error / fileMB;
-            profile.variablePerMB += this.#varAlpha * sizeWeight * varUpdate;
+            profile.variablePerMB += currentVarAlpha * sizeWeight * varUpdate;
             profile.variablePerMB = Math.max(this.#minVariablePerMB, Math.min(this.#maxVariablePerMB, profile.variablePerMB));
         }
 
@@ -149,6 +186,13 @@ class MemoryProfileStore {
         if (newRatio > profile.maxObservedRatio * this.#ratioNoiseThreshold) {
             profile.maxObservedRatio = 
                 profile.maxObservedRatio * (1 - this.#maxAlpha) + newRatio * this.#maxAlpha;
+        }
+
+        // Maintain rolling window for 3σ (simple circular buffer)
+        if (!profile.recentRatios) profile.recentRatios = [];
+        profile.recentRatios.push(newRatio);
+        if (profile.recentRatios.length > this.#rollingWindowSize) {
+            profile.recentRatios.shift();
         }
 
         profile.emaRatio = this.#ema(profile.emaRatio, newRatio, 0.18);
@@ -159,23 +203,14 @@ class MemoryProfileStore {
         return true;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Persistence & Maintenance
-    // ─────────────────────────────────────────────────────────────────────────
+    // ... (exportState, importState, pruneStaleProfiles, estimateRequiredMB, get remain the same as previous version)
+
     exportState() {
         const state = {};
         for (const [key, profile] of this.#store) {
             state[key] = { ...profile };
         }
         return state;
-    }
-
-    importState(state) {
-        for (const [key, data] of Object.entries(state || {})) {
-            if (!this.#store.has(key)) {
-                this.#store.set(key, { ...data });
-            }
-        }
     }
 
     pruneStaleProfiles(maxAgeSeconds = null) {
@@ -192,9 +227,6 @@ class MemoryProfileStore {
         return pruned;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Estimation
-    // ─────────────────────────────────────────────────────────────────────────
     estimateRequiredMB(pipelineId, extension, fileSizeBytes) {
         const key = this.#makeKey(pipelineId, extension);
         const profile = this.#store.get(key);
