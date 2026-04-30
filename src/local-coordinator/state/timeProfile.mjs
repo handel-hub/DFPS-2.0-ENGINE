@@ -17,6 +17,7 @@ class TimeProfileManager {
 
             defaultBaseMs: Number(userConfig.defaultBaseMs ?? 280),
             defaultSizeRate: Number(userConfig.defaultSizeRate ?? 2.2),
+            minSizeRate: Number(userConfig.minSizeRate ?? 0.1),
             fastLearningRate: Number(userConfig.fastLearningRate ?? 0.18),
             stableLearningRate: Number(userConfig.stableLearningRate ?? 0.045),
             fastLearningThreshold: Number(userConfig.fastLearningThreshold ?? 60),
@@ -24,6 +25,7 @@ class TimeProfileManager {
             // === Refined Weighted Blending ===
             seededWeightBase: Number(userConfig.seededWeightBase ?? 0.70),
             localWeightGrowthRate: Number(userConfig.localWeightGrowthRate ?? 0.018),
+            blendSigmoidCenter: Number(userConfig.blendSigmoidCenter ?? 40),
             minSeededWeight: Number(userConfig.minSeededWeight ?? 0.15),
             errorBoostFactor: Number(userConfig.errorBoostFactor ?? 1.75),
             underEstimateBoost: Number(userConfig.underEstimateBoost ?? 1.4),
@@ -39,6 +41,8 @@ class TimeProfileManager {
 
             // === Prediction Bounds ===
             minPredictedDurationMs: Number(userConfig.minPredictedDurationMs ?? 80),
+            defaultProfileVarianceMs: Number(userConfig.defaultProfileVarianceMs ?? 1200),
+            fallbackLocalVarianceMs: Number(userConfig.fallbackLocalVarianceMs ?? 1800),
             minSizeMB: Number(userConfig.minSizeMB ?? 1),
             defaultFileSizeMB: Number(userConfig.defaultFileSizeMB ?? 1),
 
@@ -57,15 +61,21 @@ class TimeProfileManager {
             localSource: userConfig.localSource ?? 'local',
         };
 
+        // numeric sanity
+        if (!Number.isFinite(this.#config.stalenessHalfLifeDays) || this.#config.stalenessHalfLifeDays <= 0) {
+            this.#config.stalenessHalfLifeDays = 7;
+        }
+        if (!Number.isFinite(this.#config.blendSigmoidCenter) || this.#config.blendSigmoidCenter < 0) {
+            this.#config.blendSigmoidCenter = 40;
+        }
+
         this.#config.stalenessHalfLifeMs = this.#config.stalenessHalfLifeDays * 24 * 60 * 60 * 1000;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Private Helpers
-    // ─────────────────────────────────────────────────────────────────────────
 
     #normalizeContextTag(contextFactors = {}) {
-        if (!contextFactors || typeof contextFactors !== 'object') 
+        if (!contextFactors || typeof contextFactors !== 'object' || Array.isArray(contextFactors)) 
             return this.#config.defaultContextTag;
 
         const parts = [];
@@ -75,8 +85,13 @@ class TimeProfileManager {
         return parts.length > 0 ? parts.join('-') : this.#config.defaultContextTag;
     }
 
+    #safePart(x) {
+        if (x === undefined || x === null) return '';
+        return String(x);
+    }
+
     #getModelKey(pipelineId, pluginId, extension, contextTag) {
-        return `${pipelineId}:${pluginId}:${extension}:${contextTag}`;
+        return `${this.#safePart(pipelineId)}:${this.#safePart(pluginId)}:${this.#safePart(extension)}:${this.#safePart(contextTag)}`;
     }
 
     #getStalenessFactor(lastUpdated) {
@@ -92,22 +107,24 @@ class TimeProfileManager {
                 sizeRate: this.#config.defaultSizeRate,
                 variance_ms: 1500,
                 sampleCount: 0,
-                lastUpdated: Date.now()
+                lastUpdated: Date.now(),
+                errorEWMA: 0,
+                errorCount: 0
             },
             local: {
                 base_ms: this.#config.defaultBaseMs,
                 sizeRate: this.#config.defaultSizeRate,
                 variance_ms: 1800,
                 sampleCount: 0,
-                lastUpdated: Date.now()
+                lastUpdated: Date.now(),
+                errorEWMA: 0,
+                errorCount: 0
             },
             spawn: {
                 latency_ms: this.#config.defaultSpawnLatencyMs,
                 variance_ms: this.#config.spawnVarianceMs,
                 sampleCount: 0
-            },
-            errorEWMA: 0,
-            errorCount: 0
+            }
         };
     }
 
@@ -115,22 +132,25 @@ class TimeProfileManager {
         model.sampleCount += 1;
         model.lastUpdated = Date.now();
 
-        const currentPred = model.base_ms + model.sizeRate * sizeMB;
+        const effectiveSizeMB = Math.max(sizeMB, this.#config.minSizeMB);
+        const currentPred = model.base_ms + model.sizeRate * effectiveSizeMB;
         const error = actualDuration - currentPred;
 
         let learningRate = model.sampleCount < this.#config.fastLearningThreshold
             ? this.#config.fastLearningRate
             : this.#config.stableLearningRate;
 
-        // Large Error Boost with Asymmetric Correction
         if (model.errorEWMA > this.#config.largeErrorThreshold) {
             const boost = this.#config.errorBoostFactor * 
                          (isUnderEstimate ? this.#config.underEstimateBoost : 1.0);
             learningRate *= boost;
         }
 
-        model.sizeRate += learningRate * (error / Math.max(sizeMB, this.#config.minSizeMB));
+        model.sizeRate += learningRate * (error / effectiveSizeMB);
         model.base_ms += learningRate * error * 0.25;
+
+        // enforce minimum sizeRate to avoid negative/zero pathological values
+        model.sizeRate = Math.max(model.sizeRate, this.#config.minSizeRate);
 
         model.variance_ms = (model.variance_ms || 1800) * this.#config.varianceDecay 
                           + Math.abs(error) * this.#config.varianceGrowth;
@@ -182,12 +202,10 @@ class TimeProfileManager {
         };
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Public Methods
-    // ─────────────────────────────────────────────────────────────────────────
 
     getTimeProfile(pipelineId, pluginId, extension, fileSizeMB, contextFactors = {}) {
-        if (typeof fileSizeMB !== 'number' || fileSizeMB <= 0) {
+        if (typeof fileSizeMB !== 'number' || !Number.isFinite(fileSizeMB) || fileSizeMB <= 0) {
             fileSizeMB = this.#config.defaultFileSizeMB;
         }
 
@@ -198,7 +216,6 @@ class TimeProfileManager {
         let model = this.#store.get(specificKey);
         let source = this.#config.defaultSource;
 
-        // Smart fallback logic
         if (model) {
             if (model.local.sampleCount < this.#config.minContextSamplesForSpecific) {
                 const defaultModel = this.#store.get(defaultKey);
@@ -220,27 +237,22 @@ class TimeProfileManager {
             return this.#getSafeDefaultProfile(pipelineId, pluginId, extension, fileSizeMB, contextTag);
         }
 
-        // ==================== REFINED WEIGHTED BLENDING ====================
         const localSamples = model.local.sampleCount;
 
-        // Sigmoid-style smooth transition: seeded → local
-        let localWeight = 1 / (1 + Math.exp(-this.#config.localWeightGrowthRate * (localSamples - 40)));
-
+        // use configurable sigmoid center
+        let localWeight = 1 / (1 + Math.exp(-this.#config.localWeightGrowthRate * (localSamples - this.#config.blendSigmoidCenter)));
         let seededWeight = 1 - localWeight;
 
-        // Enforce minimum seeded weight floor
         seededWeight = Math.max(this.#config.minSeededWeight, seededWeight);
         localWeight = 1 - seededWeight;
 
-        // Large error boost (asymmetric)
-        if (model.errorEWMA > this.#config.largeErrorThreshold) {
+        if (model.local.errorEWMA > this.#config.largeErrorThreshold) {
             const boost = this.#config.errorBoostFactor * 
-                         (model.errorEWMA > this.#config.largeErrorThreshold * 1.5 ? 1.25 : 1.0);
+                         (model.local.errorEWMA > this.#config.largeErrorThreshold * 1.5 ? 1.25 : 1.0);
             localWeight = Math.min(1.0, localWeight * boost);
             seededWeight = 1 - localWeight;
         }
 
-        // Compute blended prediction
         const seededDuration = model.seeded.base_ms + model.seeded.sizeRate * fileSizeMB;
         const localDuration = model.local.base_ms + model.local.sizeRate * fileSizeMB;
 
@@ -292,18 +304,30 @@ class TimeProfileManager {
 
         const contextTag = this.#normalizeContextTag(record.contextFactors);
         const key = this.#getModelKey(record.pipelineId, record.pluginId, record.extension, contextTag);
+        const defaultKey = this.#getModelKey(record.pipelineId, record.pluginId, record.extension, this.#config.defaultContextTag);
 
         const actualDuration = record.timestamps.writeCompleteAt - record.timestamps.assignedAt;
         if (actualDuration <= 0) return;
 
-        // Get current prediction for error calculation
-        const currentPrediction = this.getTimeProfile(
-            record.pipelineId,
-            record.pluginId,
-            record.extension,
-            record.dataSizeMB || this.#config.defaultFileSizeMB,
-            record.contextFactors
-        ).duration_ms;
+        const sizeMB = (typeof record.dataSizeMB === 'number' && Number.isFinite(record.dataSizeMB) && record.dataSizeMB > 0)
+            ? record.dataSizeMB
+            : this.#config.defaultFileSizeMB;
+
+        // ensure default model exists before computing prediction to avoid races
+        if (!this.#store.has(defaultKey)) {
+            this.#store.set(defaultKey, this.#createNewDualModel());
+        }
+
+        const existing = this.#store.get(key) || this.#store.get(defaultKey);
+
+        let currentPrediction;
+        if (existing) {
+            const seededDuration = existing.seeded.base_ms + existing.seeded.sizeRate * sizeMB;
+            const localDuration = existing.local.base_ms + existing.local.sizeRate * sizeMB;
+            currentPrediction = Math.round(existing.local.sampleCount > 0 ? localDuration : seededDuration);
+        } else {
+            currentPrediction = Math.round(this.#config.defaultBaseMs + this.#config.defaultSizeRate * sizeMB);
+        }
 
         const isUnderEstimate = actualDuration > currentPrediction;
         const relativeError = Math.abs(actualDuration - currentPrediction) / 
@@ -315,11 +339,20 @@ class TimeProfileManager {
 
         const dualModel = this.#store.get(key);
 
-        // Update Time Model with refined learning
+        // Update default model first deterministically
+        this.#updateLocalModel(
+            this.#store.get(defaultKey).local,
+            actualDuration,
+            sizeMB,
+            relativeError,
+            isUnderEstimate
+        );
+
+        // Update Time Model with refined learning (local)
         this.#updateLocalModel(
             dualModel.local, 
             actualDuration, 
-            record.dataSizeMB || this.#config.defaultFileSizeMB, 
+            sizeMB, 
             relativeError, 
             isUnderEstimate
         );
@@ -336,33 +369,18 @@ class TimeProfileManager {
             this.#updateSpawnModel(dualModel.spawn, record.dispatcherInfo.startupPenalty);
         }
 
-        // Update Error EWMA
-        dualModel.errorEWMA = dualModel.errorCount === 0
+        // Update Error EWMA on local model
+        const local = dualModel.local;
+        local.errorEWMA = local.errorCount === 0
             ? relativeError
-            : this.#config.largeErrorEwmaAlpha * relativeError + 
-              (1 - this.#config.largeErrorEwmaAlpha) * dualModel.errorEWMA;
-
-        dualModel.errorCount = Math.min(this.#config.maxErrorCount, dualModel.errorCount + 1);
-
-        // Hierarchical update on default model
-        const defaultKey = this.#getModelKey(record.pipelineId, record.pluginId, record.extension, this.#config.defaultContextTag);
-        if (!this.#store.has(defaultKey)) {
-            this.#store.set(defaultKey, this.#createNewDualModel());
-        }
-
-        this.#updateLocalModel(
-            this.#store.get(defaultKey).local,
-            actualDuration,
-            record.dataSizeMB || this.#config.defaultFileSizeMB,
-            relativeError,
-            isUnderEstimate
-        );
+            : this.#config.largeErrorEwmaAlpha * relativeError +
+              (1 - this.#config.largeErrorEwmaAlpha) * local.errorEWMA;
+        local.errorCount = Math.min(this.#config.maxErrorCount, local.errorCount + 1);
     }
 
     // Management Methods
     seedFromCluster(seedData) {
         console.log(`[TimeProfileManager] Seeded ${seedData?.profiles?.length || 0} profiles from Master Cluster.`);
-        // TODO: Full seeding logic in future version
     }
 
     pruneStaleProfiles(maxAgeSeconds = null) {
@@ -371,6 +389,11 @@ class TimeProfileManager {
         let pruned = 0;
 
         for (const [key, profile] of this.#store.entries()) {
+            if (!profile?.local?.lastUpdated) {
+                this.#store.delete(key);
+                pruned++;
+                continue;
+            }
             if (now - profile.local.lastUpdated > age * 1000) {
                 this.#store.delete(key);
                 pruned++;
@@ -390,10 +413,38 @@ class TimeProfileManager {
     importState(state) {
         if (!state?.timeStore) return;
         this.#store.clear();
+        let imported = 0;
         for (const [key, value] of Object.entries(state.timeStore)) {
-            this.#store.set(key, value);
+            if (!value || !value.local || !value.seeded) continue;
+            // coerce numeric fields to safe numbers
+            const safe = JSON.parse(JSON.stringify(value));
+            const ensureNum = (obj, prop, fallback) => {
+                if (!obj) return;
+                obj[prop] = Number.isFinite(Number(obj[prop])) ? Number(obj[prop]) : fallback;
+            };
+            ensureNum(safe.local, 'base_ms', this.#config.defaultBaseMs);
+            ensureNum(safe.local, 'sizeRate', this.#config.defaultSizeRate);
+            ensureNum(safe.local, 'variance_ms', this.#config.fallbackLocalVarianceMs);
+            ensureNum(safe.local, 'sampleCount', 0);
+            ensureNum(safe.seeded, 'base_ms', this.#config.defaultBaseMs);
+            ensureNum(safe.seeded, 'sizeRate', this.#config.defaultSizeRate);
+            ensureNum(safe.seeded, 'variance_ms', 1500);
+            if (!safe.local.lastUpdated) safe.local.lastUpdated = Date.now();
+            if (!safe.seeded.lastUpdated) safe.seeded.lastUpdated = Date.now();
+            if (typeof safe.spawn !== 'object') safe.spawn = { latency_ms: this.#config.defaultSpawnLatencyMs, variance_ms: this.#config.spawnVarianceMs, sampleCount: 0 };
+            this.#store.set(key, safe);
+            imported++;
         }
-        console.log(`[TimeProfileManager] Imported ${Object.keys(state.timeStore).length} profiles.`);
+        console.log(`[TimeProfileManager] Imported ${imported} profiles.`);
+    }
+
+    // Debug helper for tests
+    debugDump() {
+        const out = {};
+        for (const [k, v] of this.#store.entries()) {
+            out[k] = JSON.parse(JSON.stringify(v));
+        }
+        return out;
     }
 }
 
