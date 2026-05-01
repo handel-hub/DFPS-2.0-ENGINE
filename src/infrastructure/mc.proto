@@ -1,0 +1,37 @@
+syntax = "proto3";
+package mc;
+
+option java_package = "com.example.mc";
+option java_multiple_files = true;
+
+// Event represents a single change event emitted by a worker.
+message Event {
+    uint64 sequenceId = 1;
+    string type = 2;
+    string jobId = 3;
+    string taskId = 4;
+    string payloadJson = 5; // JSON-encoded payload for flexibility
+    uint64 timestamp = 6;
+}
+
+// Batch is the compact delta sent from a worker to the MC.
+message Batch {
+    string workerId = 1;      // stable worker identity
+    uint64 fromSeq = 2;       // last known persisted sequence (exclusive)
+    uint64 toSeq = 3;         // last sequence included in this batch
+    repeated Event events = 4;
+    uint32 metaCount = 5;
+    uint64 metaBytes = 6;
+}
+
+// Ack returned by MC after processing a Batch.
+message Ack {
+    uint64 acceptedUpTo = 1;  // inclusive sequence id MC has durably persisted
+    uint32 throttleMs = 2;    // optional: instruct worker to back off
+    string message = 3;
+}
+
+service MasterCollector {
+  // IngestBatch accepts an ordered batch of events from a worker.
+    rpc IngestBatch(Batch) returns (Ack);
+}
