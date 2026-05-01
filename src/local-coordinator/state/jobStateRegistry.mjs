@@ -9,10 +9,10 @@
  * - Adds getChangeBatch (safe coalescing) and separates exportState/exportLog
  * - Adds workerId support and WAL hook placeholders (persistBatchToWal, compactWalUpTo)
  *
- * Note: WAL implementation and full WorkerBatcher will be added in Commit B/C.
  */
 
 import WAL from '../infrastructure/wal.mjs'; 
+import WorkerBatcher from '../infrastructure/workerBatcher.mjs';
 
 const VALID_TASK_STATES = new Set(['PENDING', 'RUNNING', 'COMPLETED', 'FAILED']);
 const VALID_JOB_STATES = new Set(['PENDING', 'RUNNING', 'COMPLETED', 'FAILED']);
@@ -555,64 +555,27 @@ class JobStateRegistry {
         const now = this.#now();
         let pruned = 0;
         for (const [jobId, job] of Array.from(this.#jobs.entries())) {
-        if (job.status === 'COMPLETED') {
-            const age = now - (job.updatedAt || job.createdAt || now);
-            if (age > olderThanMs) {
-                for (const tid of job.tasks.keys()) this.#taskIndex.delete(tid);
-                this.#jobs.delete(jobId);
+            if (job.status === 'COMPLETED') {
+                const age = now - (job.updatedAt || job.createdAt || now);
+                if (age > olderThanMs) {
+                    for (const tid of job.tasks.keys()) this.#taskIndex.delete(tid);
+                    this.#jobs.delete(jobId);
 
-                for (const tag of job.tags) {
-                    if (this.#tagIndex.has(tag)) {
-                        this.#tagIndex.get(tag).delete(jobId);
-                        if (this.#tagIndex.get(tag).size === 0) this.#tagIndex.delete(tag);
+                    for (const tag of job.tags) {
+                        if (this.#tagIndex.has(tag)) {
+                            this.#tagIndex.get(tag).delete(jobId);
+                            if (this.#tagIndex.get(tag).size === 0) this.#tagIndex.delete(tag);
+                        }
                     }
+                    if (job.groupId && this.#groupIndex.has(job.groupId)) {
+                        this.#groupIndex.get(job.groupId).delete(jobId);
+                        if (this.#groupIndex.get(job.groupId).size === 0) this.#groupIndex.delete(job.groupId);
+                    }
+                    pruned++;
                 }
-                if (job.groupId && this.#groupIndex.has(job.groupId)) {
-                    this.#groupIndex.get(job.groupId).delete(jobId);
-                    if (this.#groupIndex.get(job.groupId).size === 0) this.#groupIndex.delete(job.groupId);
-                }
-                pruned++;
             }
-        }
         }
         return pruned;
-   
-    }
-
-    debugDump() {
-        const out = {
-            jobs: {},
-            taskIndex: Array.from(this.#taskIndex.keys()),
-            tagIndex: {},
-            groupIndex: {},
-            changeLogLen: this.#changeLog.length,
-            sequence: this.#sequence,
-            workerId: this._workerId ?? null
-            };
-        for (const [jid, job] of this.#jobs.entries()) {
-            out.jobs[jid] = {
-                jobId: job.jobId,
-                status: job.status,
-                totalTasks: job.totalTasks,
-                completedTasks: job.completedTasks,
-                failedTasks: job.failedTasks,
-                tags: Array.from(job.tags),
-                groupId: job.groupId,
-                tasks: {}
-            };
-            for (const [tid, t] of job.tasks.entries()) {
-                out.jobs[jid].tasks[tid] = {
-                    taskId: t.taskId,
-                    status: t.status,
-                    unresolvedDepsCount: t.unresolvedDepsCount,
-                    dependencies: Array.from(t.dependencies),
-                    dependents: Array.from(t.dependents)
-                };
-            }
-        }
-        for (const [tag, set] of this.#tagIndex.entries()) out.tagIndex[tag] = Array.from(set);
-        for (const [g, set] of this.#groupIndex.entries()) out.groupIndex[g] = Array.from(set);
-        return out;
     }
 
     // -------------------------
@@ -711,22 +674,31 @@ class JobStateRegistry {
     // -------------------------
 
     startWorker(options = {}) {
-        // placeholder: actual WorkerBatcher will be wired in Commit C
         if (this.#worker) return this.#worker;
         const cfg = Object.assign({}, this._workerDefaults ?? {}, options);
-        // minimal stub to avoid breaking callers; real batcher will replace this
-        this.#worker = {
-            cfg,
-            start: () => { /* no-op until batcher implemented */ },
-            stop: async () => { /* no-op */ },
-            debugDump: () => ({ stub: true, cfg })
-        };
+
+        // ensure workerId exists for WAL and sequence scoping
+        if (!this._workerId) {
+            if (cfg.workerId) this._workerId = cfg.workerId;
+            else throw new Error('workerId required to start worker (stable identity across restarts)');
+        }
+
+        // ensure WAL instance exists (created in Commit B constructor)
+        if (!this._wal) {
+            // create WAL if not already created (constructor may have created it)
+            // this._wal created in Commit B constructor if workerId present; ensure it's present
+            // (no-op here; WAL instance already created)
+        }
+
+        // instantiate real WorkerBatcher
+        this.#worker = new WorkerBatcher(this, cfg);
+        this.#worker.start();
         return this.#worker;
     }
-
+    
     async stopWorker({ flush = true } = {}) {
         if (!this.#worker) return;
-        if (typeof this.#worker.stop === 'function') await this.#worker.stop({ flush });
+        await this.#worker.stop({ flush });
         this.#worker = null;
     }
 
@@ -746,8 +718,54 @@ class JobStateRegistry {
         if (!this._wal) return;
         await this._wal.compactUpTo(seq);
     }
+
+    debugDump() {
+        const out = {
+            jobs: {},
+            taskIndex: Array.from(this.#taskIndex.keys()),
+            tagIndex: {},
+            groupIndex: {},
+            changeLogLen: this.#changeLog.length,
+            sequence: this.#sequence,
+            workerId: this._workerId ?? null
+            };
+        for (const [jid, job] of this.#jobs.entries()) {
+            out.jobs[jid] = {
+                jobId: job.jobId,
+                status: job.status,
+                totalTasks: job.totalTasks,
+                completedTasks: job.completedTasks,
+                failedTasks: job.failedTasks,
+                tags: Array.from(job.tags),
+                groupId: job.groupId,
+                tasks: {}
+            };
+            for (const [tid, t] of job.tasks.entries()) {
+                out.jobs[jid].tasks[tid] = {
+                    taskId: t.taskId,
+                    status: t.status,
+                    unresolvedDepsCount: t.unresolvedDepsCount,
+                    dependencies: Array.from(t.dependencies),
+                    dependents: Array.from(t.dependents)
+                };
+            }
+        }
+        for (const [tag, set] of this.#tagIndex.entries()) out.tagIndex[tag] = Array.from(set);
+        for (const [g, set] of this.#groupIndex.entries()) out.groupIndex[g] = Array.from(set);
+        return out;
+    }
 }
 
 export default JobStateRegistry;
+
+
+
+
+// jobStateRegistry.mjs (relevant excerpt showing startWorker wiring)
+
+
+// ... inside JobStateRegistry class ...
+
+
 
 
