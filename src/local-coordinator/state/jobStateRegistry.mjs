@@ -34,7 +34,10 @@ class JobStateRegistry {
     #worker = null;
 
     constructor(opts = {}) {
-        this.#pruneCompletedAfterMs = typeof opts.pruneCompletedAfterMs === 'number' ? opts.pruneCompletedAfterMs : null;
+    this.#pruneCompletedAfterMs = typeof opts.pruneCompletedAfterMs === 'number' ? opts.pruneCompletedAfterMs : null;
+        // stable worker identity (optional). If provided, sequenceId is scoped to this worker.
+        // Worker must reuse the same workerId across restarts to preserve monotonic sequence semantics.
+        this._workerId = opts.workerId ?? null;
     }
 
     // -------------------------
@@ -410,46 +413,48 @@ class JobStateRegistry {
         };
     }
 
+    // exportState: state only (no changeLog)
     exportState() {
         const timeStore = {};
         for (const [jobId, job] of this.#jobs.entries()) {
-        const tasks = {};
-        for (const [tid, t] of job.tasks.entries()) {
-            tasks[tid] = {
-            taskId: t.taskId,
-            jobId: t.jobId,
-            status: t.status,
-            retries: t.retries,
-            assignedWorker: t.assignedWorker,
-            startedAt: t.startedAt,
-            completedAt: t.completedAt,
-            lastError: t.lastError,
-            dependencies: Array.from(t.dependencies),
-            dependents: Array.from(t.dependents),
-            unresolvedDepsCount: t.unresolvedDepsCount
+            const tasks = {};
+            for (const [tid, t] of job.tasks.entries()) {
+                tasks[tid] = {
+                    taskId: t.taskId,
+                    jobId: t.jobId,
+                    status: t.status,
+                    retries: t.retries,
+                    assignedWorker: t.assignedWorker,
+                    startedAt: t.startedAt,
+                    completedAt: t.completedAt,
+                    lastError: t.lastError,
+                    dependencies: Array.from(t.dependencies),
+                    dependents: Array.from(t.dependents),
+                    unresolvedDepsCount: t.unresolvedDepsCount
+                };
+            }
+            timeStore[jobId] = {
+                jobId: job.jobId,
+                status: job.status,
+                totalTasks: job.totalTasks,
+                completedTasks: job.completedTasks,
+                failedTasks: job.failedTasks,
+                createdAt: job.createdAt,
+                updatedAt: job.updatedAt,
+                metadata: this.#safeClone(job.metadata),
+                tags: Array.from(job.tags),
+                groupId: job.groupId,
+                tasks
             };
         }
-        timeStore[jobId] = {
-            jobId: job.jobId,
-            status: job.status,
-            totalTasks: job.totalTasks,
-            completedTasks: job.completedTasks,
-            failedTasks: job.failedTasks,
-            createdAt: job.createdAt,
-            updatedAt: job.updatedAt,
-            metadata: this.#safeClone(job.metadata),
-            tags: Array.from(job.tags),
-            groupId: job.groupId,
-            tasks
-        };
-        }
-        return {
-        state: timeStore,
-        changeLog: this.#safeClone(this.#changeLog),
-        sequence: this.#sequence,
-        exportedAt: this.#now()
-        };
+        return { state: timeStore, exportedAt: this.#now() };
     }
+
+// exportLog: changeLog only (for write-behind)
+exportLog() {
+    return { changeLog: this.#safeClone(this.#changeLog), sequence: this.#sequence, exportedAt: this.#now() };
+}
+
 
     importState(snapshot) {
         if (!snapshot || !snapshot.state) return;
@@ -598,6 +603,110 @@ class JobStateRegistry {
         return out;
     }
 
+    // Placeholder: persist a batch to WAL (implemented in Commit B)
+    async persistBatchToWal(batch) {
+        // no-op placeholder; real implementation will append length-prefixed + CRC records
+        return;
+    }
+
+    // Placeholder: compact WAL up to sequence (implemented in Commit B)
+    async compactWalUpTo(seq) {
+        // no-op placeholder
+        return;
+    }
+
+    /**
+ * getChangeBatch(fromSeq, options)
+ * - fromSeq: last sequence the consumer has (exclusive)
+ * - options: { maxEvents = 200, maxBytes = 256*1024, coalesce = true, coalesceWindowMs = 500 }
+ *
+ * Returns: { fromSeq, toSeq, events: [mergedEvent...], meta: { count, bytes } }
+ *
+ * Coalescing is safe: merges only within a single batch window and preserves failure context.
+ */
+    getChangeBatch(fromSeq = 0, { maxEvents = 200, maxBytes = 256 * 1024, coalesce = true, coalesceWindowMs = 500 } = {}) {
+        if (!Number.isFinite(fromSeq) || fromSeq < 0) fromSeq = 0;
+        const events = this.#changeLog.filter(e => e.sequenceId > fromSeq);
+        if (!events.length) return { fromSeq, toSeq: fromSeq, events: [], meta: { count: 0, bytes: 0 } };
+
+        // Optionally coalesce within the batch window
+        let selected = events;
+        if (coalesce) {
+            // Build map keyed by jobId:taskId
+            const map = new Map();
+            for (const e of events) {
+                const key = e.taskId ? `${e.jobId}:${e.taskId}` : `${e.jobId}::${e.sequenceId}`;
+                // If existing, merge safely; otherwise set
+                if (!map.has(key)) {
+                    // shallow clone to avoid mutating original changeLog
+                    map.set(key, JSON.parse(JSON.stringify(e)));
+                } else {
+                    const prev = map.get(key);
+                    // merge semantics:
+                    // - status: last-wins (use e)
+                    // - retries: max
+                    // - startedAt: earliest non-null
+                    // - completedAt: latest non-null
+                    // - lastError: keep last non-null; preserve history if failed then retried
+                    prev.sequenceId = e.sequenceId; // advance to last sequence for ordering
+                    prev.timestamp = e.timestamp;
+                    prev.type = e.type ?? prev.type;
+                    prev.payload = prev.payload ?? {};
+                    const p = prev.payload || {};
+                    const q = e.payload || {};
+
+                    // status
+                    if (q.status !== undefined) p.status = q.status;
+
+                    // retries
+                    p.retries = Math.max(Number(p.retries || 0), Number(q.retries || 0));
+
+                    // startedAt
+                    if (p.startedAt == null && q.startedAt != null) p.startedAt = q.startedAt;
+                    if (p.startedAt != null && q.startedAt != null) p.startedAt = Math.min(p.startedAt, q.startedAt);
+
+                    // completedAt
+                    if (q.completedAt != null) {
+                        p.completedAt = p.completedAt == null ? q.completedAt : Math.max(p.completedAt, q.completedAt);
+                    }
+
+                    // lastError handling
+                    if (q.lastError) {
+                        // preserve previous failure history
+                        p.lastErrorHistory = p.lastErrorHistory || [];
+                        if (p.lastError) p.lastErrorHistory.push(p.lastError);
+                        p.lastError = q.lastError;
+                    }
+
+                    // merge other simple fields: prefer last non-null
+                    for (const k of Object.keys(q)) {
+                        if (['status','retries','startedAt','completedAt','lastError'].includes(k)) continue;
+                        if (q[k] !== undefined && q[k] !== null) p[k] = q[k];
+                    }
+
+                    prev.payload = p;
+                    map.set(key, prev);
+                }
+            }
+            selected = Array.from(map.values()).sort((a,b) => a.sequenceId - b.sequenceId);
+        }
+
+        // Trim by maxEvents and maxBytes
+        const batch = [];
+        let bytes = 0;
+        for (const e of selected) {
+            const s = JSON.stringify(e);
+            const len = Buffer.byteLength(s, 'utf8');
+            if (batch.length >= maxEvents) break;
+            if (bytes + len > maxBytes) break;
+            batch.push(e);
+            bytes += len;
+        }
+        const toSeq = batch.length ? batch[batch.length - 1].sequenceId : fromSeq;
+        return { fromSeq, toSeq, events: batch, meta: { count: batch.length, bytes } };
+    }
+
+
     // -------------------------
     // Integrated WriteBehindWorker
     // -------------------------
@@ -609,7 +718,7 @@ class JobStateRegistry {
      *
      * Returns the worker instance (for debug or manual control).
      */
-    startWriteBehind(options = {}) {
+    /*startWriteBehind(options = {}) {
         if (this.#worker) return this.#worker; // already running
         this.#worker = new WriteBehindWorker({
         registry: this,
@@ -628,7 +737,7 @@ class JobStateRegistry {
         if (!this.#worker) return;
         await this.#worker.stop({ flush });
         this.#worker = null;
-    }
+    } */
     }
 
 
