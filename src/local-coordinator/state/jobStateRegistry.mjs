@@ -570,6 +570,7 @@ class JobStateRegistry {
         }
         }
         return pruned;
+   
     }
 
     debugDump() {
