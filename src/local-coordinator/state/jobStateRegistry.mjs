@@ -2,7 +2,7 @@
 'use strict';
 
 /**
- * JobStateRegistry with worker batching hooks (Commit A)
+ * JobStateRegistry with worker batching hooks 
  *
  * - In-memory registry for jobs and tasks (DAG, tags, groups)
  * - Append-only change log
@@ -11,6 +11,8 @@
  *
  * Note: WAL implementation and full WorkerBatcher will be added in Commit B/C.
  */
+
+import WAL from '../infrastructure/wal.mjs'; 
 
 const VALID_TASK_STATES = new Set(['PENDING', 'RUNNING', 'COMPLETED', 'FAILED']);
 const VALID_JOB_STATES = new Set(['PENDING', 'RUNNING', 'COMPLETED', 'FAILED']);
@@ -28,14 +30,18 @@ class JobStateRegistry {
     #worker = null;
 
     constructor(opts = {}) {
-        this.#pruneCompletedAfterMs = typeof opts.pruneCompletedAfterMs === 'number' ? opts.pruneCompletedAfterMs : null;
+    this.#pruneCompletedAfterMs = typeof opts.pruneCompletedAfterMs === 'number' ? opts.pruneCompletedAfterMs : null;
+    this._workerId = opts.workerId ?? null;
+    this._workerDefaults = opts.workerDefaults ?? {};
+    // WAL config (optional)
+    this._walDir = opts.walDir ?? './wal';
+    this._walRotateBytes = typeof opts.walRotateBytes === 'number' ? opts.walRotateBytes : 64 * 1024 * 1024;
+    this._wal = null;
+    if (this._workerId) {
+        // initialize WAL instance (lazy open)
+        this._wal = new WAL({ walDir: this._walDir, workerId: this._workerId, walRotateBytes: this._walRotateBytes });
+    }
 
-        // Stable worker identity (optional). If provided, sequenceId is scoped to this worker.
-        // Worker should reuse the same workerId across restarts to preserve monotonic sequence semantics.
-        this._workerId = opts.workerId ?? null;
-
-        // default worker options placeholder (can be overridden when starting worker)
-        this._workerDefaults = opts.workerDefaults ?? {};
     }
 
     // -------------------------
@@ -726,15 +732,22 @@ class JobStateRegistry {
 
     // Placeholder: persist a batch to WAL (implemented in Commit B)
     async persistBatchToWal(batch) {
-        // no-op placeholder; real implementation will append length-prefixed + CRC records
-        return;
+        if (!this._wal) {
+            // WAL not configured; no-op but return
+            return;
+        }
+         // wrap batch in envelope to include batch metadata for compaction
+        const envelope = { batch, workerId: this._workerId, toSeq: batch.toSeq ?? (batch.events && batch.events.length ? batch.events[batch.events.length-1].sequenceId : null) };
+        await this._wal.appendBatch(envelope);
     }
 
     // Placeholder: compact WAL up to sequence (implemented in Commit B)
     async compactWalUpTo(seq) {
-        // no-op placeholder
-        return;
+        if (!this._wal) return;
+        await this._wal.compactUpTo(seq);
     }
 }
 
 export default JobStateRegistry;
+
+
