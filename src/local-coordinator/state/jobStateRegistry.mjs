@@ -757,15 +757,3 @@ class JobStateRegistry {
 }
 
 export default JobStateRegistry;
-
-
-
-
-// jobStateRegistry.mjs (relevant excerpt showing startWorker wiring)
-
-
-// ... inside JobStateRegistry class ...
-
-
-
-
