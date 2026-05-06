@@ -21,6 +21,7 @@ class ExternalJobQueue extends EventEmitter {
 
         // Core storage
         this.buffer = [];
+        this.backup = [];
         this.jobIdSet = new Set();
         this.recentlyProcessed = new Set(); // Optional short-term memory
 
@@ -36,6 +37,14 @@ class ExternalJobQueue extends EventEmitter {
 
         if (this.config.enableLogging) {
             console.log(`[Queue] Initialized with softMaxSize = ${this.config.softMaxSize}`);
+        }
+
+        this.on('cleanBackup', () => {
+            this.#handleBackupCleanup();
+        });
+
+        if (this.config.enableLogging) {
+            console.log(`[Queue] Initialized and listening for 'cleanBackup'`);
         }
     }
 
@@ -116,6 +125,7 @@ class ExternalJobQueue extends EventEmitter {
             this.recentlyProcessed.delete(iterator.next().value);
         }
 
+        this.backup = [...this.buffer]
         this.buffer = [];
         this.metrics.totalDequeued += jobs.length;
         this.metrics.lastDequeueTime = Date.now();
@@ -142,6 +152,7 @@ class ExternalJobQueue extends EventEmitter {
         this.jobIdSet.clear();
         this.recentlyProcessed.clear();
         if (this.config.enableLogging) console.log('[Queue] Cleared');
+        this.#handleBackupCleanup()
     }
 
   // ==================== Observability & Debugging ====================
@@ -167,6 +178,15 @@ class ExternalJobQueue extends EventEmitter {
             overSoftLimit: this.buffer.length > this.config.softMaxSize,
             totalInSystem: this.metrics.totalEnqueued - this.metrics.totalDequeued,
         });
+    }
+
+    #handleBackupCleanup() {
+        const count = this.backup.length;
+        this.backup = [];
+        
+        if (this.config.enableLogging) {
+            console.log(`[Queue] Internal Cleanup: Flushed ${count} jobs from backup.`);
+        }
     }
 }
 
