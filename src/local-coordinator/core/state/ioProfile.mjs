@@ -22,7 +22,13 @@ const DEFAULT_CONFIG = {
     // Storage / housekeeping
     PRUNE_AGE_SECONDS: 30 * 86400,
     LRU_MAX: 20000,
-    DEFAULT_ESTIMATE_BYTES: 600 * 1024 * 1024
+    DEFAULT_ESTIMATE_BYTES: 600 * 1024 * 1024,
+
+    // Quantile k(n) sigmoid parameters (smooth mapping from sample count to stddev multiplier)
+    K_SIGMOID_MIN: 1.0,   // k_min (asymptotic for large n)
+    K_SIGMOID_MAX: 3.0,   // k_max (conservative for small n)
+    K_SIGMOID_N0: 20,     // midpoint sample count
+    K_SIGMOID_S: 6,       // slope/scale
 };
 
 export default class IOProfile {
@@ -423,10 +429,15 @@ export default class IOProfile {
     }
 
     #quantileKForConfidence(n = 0) {
-        if (n < 5) return 3.0;
-        if (n < 20) return 2.0;
-        if (n < 100) return 1.5;
-        return 1.0;
+        const kMin = Number(this.#cfg.K_SIGMOID_MIN ?? 1.0);
+        const kMax = Number(this.#cfg.K_SIGMOID_MAX ?? 3.0);
+        const n0 = Number(this.#cfg.K_SIGMOID_N0 ?? 20);
+        const s = Number(this.#cfg.K_SIGMOID_S ?? 6);
+
+        const nn = Math.max(0, Number(n) || 0);
+        const x = (nn - n0) / s;
+        const logistic = 1 / (1 + Math.exp(x));
+        return kMin + (kMax - kMin) * logistic;
     }
 
     #getSafetyMultiplier(confidence = 0) {
