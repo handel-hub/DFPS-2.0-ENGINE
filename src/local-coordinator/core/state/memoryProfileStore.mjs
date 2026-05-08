@@ -59,9 +59,9 @@ class MemoryProfileStore {
         this.#pruneAgeSeconds = Number(config.pruneAgeSeconds ?? 30 * 86400);
     }
 
-    #makeKey(pipelineId, extension) {
+    #makeKey(pluginId, extension) {
         const ext = (extension || '').replace(/^\./, '').toLowerCase();
-        return `${pipelineId}::${ext}`;
+        return `${pluginId}::${ext}`;
     }
 
     #getCurrentAlpha(baseAlpha, profile) {
@@ -100,8 +100,8 @@ class MemoryProfileStore {
     // ─────────────────────────────────────────────────────────────────────────
     // Initialization with Contract Version Awareness
     // ─────────────────────────────────────────────────────────────────────────
-    initFromContract(pipelineId, extension, contract) {
-        const key = this.#makeKey(pipelineId, extension);
+    initFromContract(pluginId, extension, contract) {
+        const key = this.#makeKey(pluginId, extension);
         const existing = this.#store.get(key);
         const newVersion = contract.version || 'unknown';
 
@@ -147,8 +147,8 @@ class MemoryProfileStore {
     // ─────────────────────────────────────────────────────────────────────────
     // Update with hardened outlier rejection + dynamic alphas
     // ─────────────────────────────────────────────────────────────────────────
-    update({ pipelineId, extension, peakRamBytes, fileSizeBytes }) {
-        const key = this.#makeKey(pipelineId, extension);
+    update({ pluginId, extension, peakRamBytes, fileSizeBytes }) {
+        const key = this.#makeKey(pluginId, extension);
         const profile = this.#store.get(key);
         if (!profile) return false;
 
@@ -227,8 +227,8 @@ class MemoryProfileStore {
         return pruned;
     }
 
-    estimateRequiredMB(pipelineId, extension, fileSizeBytes) {
-        const key = this.#makeKey(pipelineId, extension);
+    estimateRequiredMB(pluginId, extension, fileSizeBytes) {
+        const key = this.#makeKey(pluginId, extension);
         const profile = this.#store.get(key);
         if (!profile) return 600;
 
@@ -249,8 +249,8 @@ class MemoryProfileStore {
         return Math.ceil(requiredMB);
     }
 
-    get(pipelineId, extension) {
-        const key = this.#makeKey(pipelineId, extension);
+    get(pluginId, extension) {
+        const key = this.#makeKey(pluginId, extension);
         const p = this.#store.get(key);
         return p ? { ...p } : null;
     }

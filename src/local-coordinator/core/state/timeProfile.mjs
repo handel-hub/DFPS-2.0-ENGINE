@@ -90,8 +90,8 @@ class TimeProfileManager {
         return String(x);
     }
 
-    #getModelKey(pipelineId, pluginId, extension, contextTag) {
-        return `${this.#safePart(pipelineId)}:${this.#safePart(pluginId)}:${this.#safePart(extension)}:${this.#safePart(contextTag)}`;
+    #getModelKey(pluginId, extension, contextTag) {
+        return `${this.#safePart(pluginId)}:${this.#safePart(extension)}:${this.#safePart(contextTag)}`;
     }
 
     #getStalenessFactor(lastUpdated) {
@@ -166,7 +166,7 @@ class TimeProfileManager {
         spawnModel.variance_ms = (spawnModel.variance_ms || 180) * 0.92 + Math.abs(error) * 0.08;
     }
 
-    #getSafeDefaultProfile(pipelineId, pluginId, extension, fileSizeMB, contextTag) {
+    #getSafeDefaultProfile( pluginId, extension, fileSizeMB, contextTag) {
         const duration = Math.max(
             this.#config.minPredictedDurationMs,
             Math.round(this.#config.defaultBaseMs + this.#config.defaultSizeRate * fileSizeMB)
@@ -193,7 +193,6 @@ class TimeProfileManager {
             contextTag: contextTag,
 
             metadata: {
-                pipelineId,
                 pluginId,
                 extension,
                 sampleCount: 0,
@@ -204,14 +203,14 @@ class TimeProfileManager {
 
     // Public Methods
 
-    getTimeProfile(pipelineId, pluginId, extension, fileSizeMB, contextFactors = {}) {
+    getTimeProfile(pluginId, extension, fileSizeMB, contextFactors = {}) {
         if (typeof fileSizeMB !== 'number' || !Number.isFinite(fileSizeMB) || fileSizeMB <= 0) {
             fileSizeMB = this.#config.defaultFileSizeMB;
         }
 
         const contextTag = this.#normalizeContextTag(contextFactors);
-        const specificKey = this.#getModelKey(pipelineId, pluginId, extension, contextTag);
-        const defaultKey = this.#getModelKey(pipelineId, pluginId, extension, this.#config.defaultContextTag);
+        const specificKey = this.#getModelKey(pluginId, extension, contextTag);
+        const defaultKey = this.#getModelKey(pluginId, extension, this.#config.defaultContextTag);
 
         let model = this.#store.get(specificKey);
         let source = this.#config.defaultSource;
@@ -234,7 +233,7 @@ class TimeProfileManager {
         }
 
         if (!model) {
-            return this.#getSafeDefaultProfile(pipelineId, pluginId, extension, fileSizeMB, contextTag);
+            return this.#getSafeDefaultProfile(pluginId, extension, fileSizeMB, contextTag);
         }
 
         const localSamples = model.local.sampleCount;
@@ -287,7 +286,6 @@ class TimeProfileManager {
             source,
             contextTag,
             metadata: {
-                pipelineId,
                 pluginId,
                 extension,
                 sampleCount: localSamples,
@@ -297,14 +295,14 @@ class TimeProfileManager {
     }
 
     recordExecution(record) {
-        if (!record?.pipelineId || !record?.pluginId || !record?.timestamps?.writeCompleteAt) {
+        if (!record?.pluginId || !record?.timestamps?.writeCompleteAt) {
             console.warn('[TimeProfileManager] Invalid ExecutionRecord');
             return;
         }
 
         const contextTag = this.#normalizeContextTag(record.contextFactors);
-        const key = this.#getModelKey(record.pipelineId, record.pluginId, record.extension, contextTag);
-        const defaultKey = this.#getModelKey(record.pipelineId, record.pluginId, record.extension, this.#config.defaultContextTag);
+        const key = this.#getModelKey(record.pluginId, record.extension, contextTag);
+        const defaultKey = this.#getModelKey( record.pluginId, record.extension, this.#config.defaultContextTag);
 
         const actualDuration = record.timestamps.writeCompleteAt - record.timestamps.assignedAt;
         if (actualDuration <= 0) return;

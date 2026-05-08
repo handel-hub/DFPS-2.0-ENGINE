@@ -81,7 +81,7 @@ class CpuProfileManager {
     // Public API
     // ─────────────────────────────────────────────────────────────────────────
 
-    getCpuProfile(pluginId, extension) {
+    getCpuProfile(pluginId, extension,context) {
         const key = this.#getKey(pluginId, extension);
         let profile = this.#store.get(key);
 
