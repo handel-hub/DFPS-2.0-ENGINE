@@ -55,7 +55,6 @@ class TimeProfileManager {
             maxErrorCount: Number(userConfig.maxErrorCount ?? 5),
 
             // === Strings ===
-            defaultContextTag: userConfig.defaultContextTag ?? 'default',
             defaultSource: userConfig.defaultSource ?? 'default',
             fallbackSource: userConfig.fallbackSource ?? 'fallback',
             localSource: userConfig.localSource ?? 'local',
@@ -72,27 +71,105 @@ class TimeProfileManager {
         this.#config.stalenessHalfLifeMs = this.#config.stalenessHalfLifeDays * 24 * 60 * 60 * 1000;
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Strict Context Mapping Utilities
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Convert context (object or [{key,value}]) into a Map of keys -> values (no aliasing)
+    #contextToMap(ctx = {}) {
+        const map = new Map();
+        if (!ctx) return map;
+
+        if (Array.isArray(ctx)) {
+            for (const e of ctx) {
+                if (!e) continue;
+                if (typeof e.key !== 'string') continue;
+                const key = e.key.trim();
+                const val = Object.prototype.hasOwnProperty.call(e, 'value') ? e.value : (Object.prototype.hasOwnProperty.call(e, 'v') ? e.v : null);
+                map.set(key, val);
+            }
+            return map;
+        }
+
+        if (typeof ctx === 'object') {
+            for (const [k, v] of Object.entries(ctx)) {
+                if (k == null) continue;
+                map.set(String(k), v);
+            }
+        }
+        return map;
+    }
+
+    // Strict normalization: require exact pluginId and extension keys (no aliases)
+    // Returns { pluginId, extension, extras: Map }
+    #normalizeContextStrict(ctx = {}) {
+        const m = this.#contextToMap(ctx);
+
+        if (!m.has('pluginId')) throw new Error('context must include pluginId');
+        if (!m.has('extension')) throw new Error('context must include extension');
+
+        // normalize pluginId and extension
+        const pluginId = String(m.get('pluginId')).trim().toLowerCase();
+        const extension = String(m.get('extension')).replace(/^\./, '').toLowerCase();
+
+        // extras: everything except the two required keys
+        const extras = new Map();
+        for (const k of m.keys()) {
+            if (k === 'pluginId' || k === 'extension') continue;
+            extras.set(String(k), m.get(k));
+        }
+
+        return { pluginId, extension, extras };
+    }
+
+    // Deterministic serialization of extras map into "k=v;k2=v2" sorted by key
+    // Keys lowercased, values stringified and trimmed; percent-encode separators.
+    #serializeExtras(extrasMap) {
+        if (!extrasMap || !(extrasMap instanceof Map) || extrasMap.size === 0) return '';
+        const pairs = [];
+        for (const k of extrasMap.keys()) {
+            const v = extrasMap.get(k);
+            const ks = String(k).trim().toLowerCase();
+            const vs = (v === null || v === undefined) ? '' : String(v).trim();
+            const safeKey = ks.replace(/[:;]/g, (c) => (c === ':' ? '%3A' : '%3B'));
+            const safeVal = vs.replace(/[:;]/g, (c) => (c === ':' ? '%3A' : '%3B'));
+            pairs.push(`${safeKey}=${safeVal}`);
+        }
+        pairs.sort(); // critical: deterministic ordering
+        return pairs.join(';');
+    }
+
+    // Short stable hash utility (kept but not used by default)
+    #shortHashOfString(s) {
+        try {
+            const crypto = require('crypto');
+            return crypto.createHash('sha1').update(s).digest('hex').slice(0, 12);
+        } catch (e) {
+            let acc = 0;
+            for (let i = 0; i < s.length; i++) acc = (acc * 31 + s.charCodeAt(i)) >>> 0;
+            return acc.toString(36);
+        }
+    }
+
+    // Build canonical key: pluginId::extension::suffix (suffix or 'ANY')
+    #makeKeyStrict(context = {}) {
+        const { pluginId, extension, extras } = this.#normalizeContextStrict(context);
+        const extrasSerialized = this.#serializeExtras(extras);
+        if (!extrasSerialized) return `${pluginId}::${extension}::ANY`;
+        return `${pluginId}::${extension}::${extrasSerialized}`;
+    }
+
+    // encodeKeysStrict returns the exact hierarchy you requested
+    #encodeKeysStrict(context = {}) {
+        const { pluginId, extension } = this.#normalizeContextStrict(context);
+        const full = this.#makeKeyStrict(context);
+        const pluginFallback = `${pluginId}::${extension}::ANY`;
+        const extFallback = `ANY::${extension}::ANY`;
+        const globalFallback = `ANY::ANY::ANY`;
+        return [full, pluginFallback, extFallback, globalFallback];
+    }
+
     // Private Helpers
-
-    #normalizeContextTag(contextFactors = {}) {
-        if (!contextFactors || typeof contextFactors !== 'object' || Array.isArray(contextFactors)) 
-            return this.#config.defaultContextTag;
-
-        const parts = [];
-        if (contextFactors.resolution) parts.push(String(contextFactors.resolution).trim());
-        if (contextFactors.bitrate) parts.push(String(contextFactors.bitrate).trim());
-
-        return parts.length > 0 ? parts.join('-') : this.#config.defaultContextTag;
-    }
-
-    #safePart(x) {
-        if (x === undefined || x === null) return '';
-        return String(x);
-    }
-
-    #getModelKey(pluginId, extension, contextTag) {
-        return `${this.#safePart(pluginId)}:${this.#safePart(extension)}:${this.#safePart(contextTag)}`;
-    }
 
     #getStalenessFactor(lastUpdated) {
         if (!lastUpdated) return 0.6;
@@ -141,8 +218,7 @@ class TimeProfileManager {
             : this.#config.stableLearningRate;
 
         if (model.errorEWMA > this.#config.largeErrorThreshold) {
-            const boost = this.#config.errorBoostFactor * 
-                         (isUnderEstimate ? this.#config.underEstimateBoost : 1.0);
+            const boost = this.#config.errorBoostFactor * (isUnderEstimate ? this.#config.underEstimateBoost : 1.0);
             learningRate *= boost;
         }
 
@@ -208,9 +284,11 @@ class TimeProfileManager {
             fileSizeMB = this.#config.defaultFileSizeMB;
         }
 
-        const contextTag = this.#normalizeContextTag(contextFactors);
-        const specificKey = this.#getModelKey(pluginId, extension, contextTag);
-        const defaultKey = this.#getModelKey(pluginId, extension, this.#config.defaultContextTag);
+        const ctx = { pluginId, extension, ...contextFactors };
+        const keys = this.#encodeKeysStrict(ctx);
+        const specificKey = keys[0];
+        const defaultKey = keys[1]; // pluginFallback maps directly to defaultKey behavior
+        const contextTag = specificKey.split('::')[2]; // Extract suffix tag for metadata matching
 
         let model = this.#store.get(specificKey);
         let source = this.#config.defaultSource;
@@ -246,8 +324,7 @@ class TimeProfileManager {
         localWeight = 1 - seededWeight;
 
         if (model.local.errorEWMA > this.#config.largeErrorThreshold) {
-            const boost = this.#config.errorBoostFactor * 
-                         (model.local.errorEWMA > this.#config.largeErrorThreshold * 1.5 ? 1.25 : 1.0);
+            const boost = this.#config.errorBoostFactor * (model.local.errorEWMA > this.#config.largeErrorThreshold * 1.5 ? 1.25 : 1.0);
             localWeight = Math.min(1.0, localWeight * boost);
             seededWeight = 1 - localWeight;
         }
@@ -300,9 +377,10 @@ class TimeProfileManager {
             return;
         }
 
-        const contextTag = this.#normalizeContextTag(record.contextFactors);
-        const key = this.#getModelKey(record.pluginId, record.extension, contextTag);
-        const defaultKey = this.#getModelKey( record.pluginId, record.extension, this.#config.defaultContextTag);
+        const ctx = { pluginId: record.pluginId, extension: record.extension, ...(record.contextFactors || {}) };
+        const keys = this.#encodeKeysStrict(ctx);
+        const key = keys[0];
+        const defaultKey = keys[1];
 
         const actualDuration = record.timestamps.writeCompleteAt - record.timestamps.assignedAt;
         if (actualDuration <= 0) return;

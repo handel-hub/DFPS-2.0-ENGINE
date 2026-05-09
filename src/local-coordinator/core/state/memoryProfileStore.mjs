@@ -59,9 +59,88 @@ class MemoryProfileStore {
         this.#pruneAgeSeconds = Number(config.pruneAgeSeconds ?? 30 * 86400);
     }
 
-    #makeKey(pluginId, extension) {
-        const ext = (extension || '').replace(/^\./, '').toLowerCase();
-        return `${pluginId}::${ext}`;
+    // Convert context (object or [{key,value}]) into a Map of keys -> values (no aliasing)
+    #contextToMap(ctx = {}) {
+        const map = new Map();
+        if (!ctx) return map;
+
+        if (Array.isArray(ctx)) {
+            for (const e of ctx) {
+                if (!e) continue;
+                if (typeof e.key !== 'string') continue;
+                const key = e.key.trim();
+                const val = Object.prototype.hasOwnProperty.call(e, 'value') ? e.value : (Object.prototype.hasOwnProperty.call(e, 'v') ? e.v : null);
+                map.set(key, val);
+            }
+            return map;
+        }
+
+        if (typeof ctx === 'object') {
+            for (const [k, v] of Object.entries(ctx)) {
+                if (k == null) continue;
+                map.set(String(k), v);
+            }
+        }
+        return map;
+    }
+
+    // Strict normalization: require exact pluginId and extension keys (no aliases)
+    // Returns { pluginId, extension, extras: Map }
+    #normalizeContextStrict(ctx = {}) {
+        const m = this.#contextToMap(ctx);
+
+        if (!m.has('pluginId')) throw new Error('context must include pluginId');
+        if (!m.has('extension')) throw new Error('context must include extension');
+
+        // normalize pluginId and extension
+        const pluginId = String(m.get('pluginId')).trim().toLowerCase();
+        const extension = String(m.get('extension')).replace(/^\./, '').toLowerCase();
+
+        // extras: everything except the two required keys
+        const extras = new Map();
+        for (const k of m.keys()) {
+            if (k === 'pluginId' || k === 'extension') continue;
+            extras.set(String(k), m.get(k));
+        }
+
+        return { pluginId, extension, extras };
+    }
+
+    // Deterministic serialization of extras map into "k=v;k2=v2" sorted by key
+    // Keys lowercased, values stringified and trimmed; percent-encode separators.
+    #serializeExtras(extrasMap) {
+        if (!extrasMap || !(extrasMap instanceof Map) || extrasMap.size === 0) return '';
+        const pairs = [];
+        for (const k of extrasMap.keys()) {
+            const v = extrasMap.get(k);
+            const ks = String(k).trim().toLowerCase();
+            const vs = (v === null || v === undefined) ? '' : String(v).trim();
+            const safeKey = ks.replace(/[:;]/g, (c) => (c === ':' ? '%3A' : '%3B'));
+            const safeVal = vs.replace(/[:;]/g, (c) => (c === ':' ? '%3A' : '%3B'));
+            pairs.push(`${safeKey}=${safeVal}`);
+        }
+        pairs.sort(); // critical: deterministic ordering
+        return pairs.join(';');
+    }
+
+    // Short stable hash utility (kept but not used by default)
+    #shortHashOfString(s) {
+        try {
+            const crypto = require('crypto');
+            return crypto.createHash('sha1').update(s).digest('hex').slice(0, 12);
+        } catch (e) {
+            let acc = 0;
+            for (let i = 0; i < s.length; i++) acc = (acc * 31 + s.charCodeAt(i)) >>> 0;
+            return acc.toString(36);
+        }
+    }
+
+    // Build canonical key: pluginId::extension::suffix (suffix or 'ANY')
+    #makeKeyStrict(context = {}) {
+        const { pluginId, extension, extras } = this.#normalizeContextStrict(context);
+        const extrasSerialized = this.#serializeExtras(extras);
+        if (!extrasSerialized) return `${pluginId}::${extension}::ANY`;
+        return `${pluginId}::${extension}::${extrasSerialized}`;
     }
 
     #getCurrentAlpha(baseAlpha, profile) {
@@ -101,7 +180,7 @@ class MemoryProfileStore {
     // Initialization with Contract Version Awareness
     // ─────────────────────────────────────────────────────────────────────────
     initFromContract(pluginId, extension, contract) {
-        const key = this.#makeKey(pluginId, extension);
+        const key = this.#makeKeyStrict({ pluginId, extension });
         const existing = this.#store.get(key);
         const newVersion = contract.version || 'unknown';
 
@@ -147,8 +226,8 @@ class MemoryProfileStore {
     // ─────────────────────────────────────────────────────────────────────────
     // Update with hardened outlier rejection + dynamic alphas
     // ─────────────────────────────────────────────────────────────────────────
-    update({ pluginId, extension, peakRamBytes, fileSizeBytes }) {
-        const key = this.#makeKey(pluginId, extension);
+    update({ pluginId, extension, peakRamBytes, fileSizeBytes, contextFactors = {} }) {
+        const key = this.#makeKeyStrict({ pluginId, extension, ...contextFactors });
         const profile = this.#store.get(key);
         if (!profile) return false;
 
@@ -203,8 +282,6 @@ class MemoryProfileStore {
         return true;
     }
 
-    // ... (exportState, importState, pruneStaleProfiles, estimateRequiredMB, get remain the same as previous version)
-
     exportState() {
         const state = {};
         for (const [key, profile] of this.#store) {
@@ -227,8 +304,8 @@ class MemoryProfileStore {
         return pruned;
     }
 
-    estimateRequiredMB(pluginId, extension, fileSizeBytes) {
-        const key = this.#makeKey(pluginId, extension);
+    estimateRequiredMB(pluginId, extension, fileSizeBytes, contextFactors = {}) {
+        const key = this.#makeKeyStrict({ pluginId, extension, ...contextFactors });
         const profile = this.#store.get(key);
         if (!profile) return 600;
 
@@ -249,8 +326,8 @@ class MemoryProfileStore {
         return Math.ceil(requiredMB);
     }
 
-    get(pluginId, extension) {
-        const key = this.#makeKey(pluginId, extension);
+    get(pluginId, extension, contextFactors = {}) {
+        const key = this.#makeKeyStrict({ pluginId, extension, ...contextFactors });
         const p = this.#store.get(key);
         return p ? { ...p } : null;
     }

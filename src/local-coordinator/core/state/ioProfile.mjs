@@ -16,7 +16,7 @@ const DEFAULT_CONFIG = {
 
     // Cold start / global seed
     COLD_SEED_G: -0.3,
-    GLOBAL_KEY: 'GLOBAL::coarse',
+    GLOBAL_KEY: 'ANY::ANY::ANY', // Updated to match new strict global fallback
     GLOBAL_UPDATE_ALPHA: 0.02, // small learning rate for global model
 
     // Storage / housekeeping
@@ -54,7 +54,7 @@ export default class IOProfile {
 
     predict(context, S_in, S0 = S_in) {
         if (!this.#isValidSize(S_in) || !this.#isValidSize(S0)) return { ok: false, reason: 'invalid_size' };
-        const ctx = this.#normalizeContext(context);
+        const ctx = this.#ensureStrictContext(context);
         const out = this.#predictInternal(ctx, Number(S_in), Number(S0));
         // metrics
         this.#metrics.gauge('ioprofile.model_count', this.#store.size);
@@ -68,10 +68,13 @@ export default class IOProfile {
         const S_out = Number(record.S_out);
         if (!this.#isValidSize(S_in) || !this.#isValidSize(S_out)) return { ok: false, reason: 'invalid_size' };
 
-        const pipelineId = record.pipelineId || (record.contextFactors && record.contextFactors.programId) || 'p';
-        const extension = record.extension || (record.contextFactors && record.contextFactors.fileType) || 'bin';
-        const context = this.#normalizeContext(record.contextFactors || {});
-        const keys = this.#encodeKeys(context, pipelineId, extension);
+        const ctx = this.#ensureStrictContext({
+            pluginId: record.pluginId || record.pipelineId,
+            extension: record.extension,
+            ...(record.contextFactors || {})
+        });
+        
+        const keys = this.#encodeKeysStrict(ctx);
         const model = this.#getOrCreateModel(keys[0]);
 
         const gRaw = this.#hybridLog(S_in, S_out);
@@ -162,9 +165,10 @@ export default class IOProfile {
         return { ok: true, g: p.g_hat, sigma: p.sigma_g, modelN: p.modelN };
     }
 
-    estimateRequiredBytes(pipelineId, extension, fileSizeBytes) {
+    estimateRequiredBytes(pluginId, extension, fileSizeBytes, contextFactors = {}) {
         if (!this.#isValidSize(fileSizeBytes)) return this.#cfg.DEFAULT_ESTIMATE_BYTES;
-        const key = this.#makeKey(pipelineId, extension, {});
+        const ctx = this.#ensureStrictContext({ pluginId, extension, ...contextFactors });
+        const key = this.#makeKeyStrict(ctx);
         const m = this.#store.get(key);
         if (!m) return this.#cfg.DEFAULT_ESTIMATE_BYTES;
         const fileMB = Math.max(1, fileSizeBytes / (1024 * 1024));
@@ -268,15 +272,17 @@ export default class IOProfile {
         return pruned;
     }
 
-    getProfile(pipelineId, extension, contextFactors = {}) {
-        const key = this.#makeKey(pipelineId, extension, contextFactors);
+    getProfile(pluginId, extension, contextFactors = {}) {
+        const ctx = this.#ensureStrictContext({ pluginId, extension, ...contextFactors });
+        const key = this.#makeKeyStrict(ctx);
         const m = this.#store.get(key);
         if (!m) return null;
         return { n: m.n, emaG: m.emaG, emaVar: m.emaVar, bias: m.bias, lastSeen: m.lastSeen, source: m.source };
     }
 
-    initFromContract(pipelineId, extension, contract = {}) {
-        const key = this.#makeKey(pipelineId, extension, {});
+    initFromContract(pluginId, extension, contract = {}) {
+        const ctx = this.#ensureStrictContext({ pluginId, extension });
+        const key = this.#makeKeyStrict(ctx);
         const existing = this.#store.get(key);
         const newVersion = contract.version || 'unknown';
         if (existing) {
@@ -335,36 +341,105 @@ export default class IOProfile {
         return Number.isFinite(Number(x)) && Number(x) >= 0;
     }
 
-    #normalizeContext(ctx = {}) {
-        if (!ctx || typeof ctx !== 'object') return {};
-        return {
-            programId: String(ctx.programId || ctx.pipelineId || 'p'),
-            fileType: String(ctx.fileType || ctx.extension || '').replace(/^\./, '').toLowerCase() || 'bin',
-            resolution: String(ctx.resolution || 'r'),
-            bitrate: String(ctx.bitrate || 'b'),
-            complexity: String(ctx.complexity || 'c')
-        };
+    // Shim to ensure legacy fields correctly map to pluginId and extension
+    #ensureStrictContext(ctx = {}) {
+        const m = { ...ctx };
+        if (!m.pluginId) m.pluginId = m.pipelineId || m.programId || 'p';
+        if (!m.extension) m.extension = m.fileType || 'bin';
+        return m;
     }
 
-    #makeKey(pipelineId, extension, context = {}) {
-        const prog = String(pipelineId || 'p').trim();
-        const ext = String(extension || (context.fileType || '')).replace(/^\./, '').toLowerCase() || 'bin';
-        const res = String(context.resolution || 'r');
-        const br = String(context.bitrate || 'b');
-        const cx = String(context.complexity || 'c');
-        return `${prog}::${ext}::${res}::${br}::${cx}`;
+    // Convert context (object or [{key,value}]) into a Map of keys -> values (no aliasing)
+    #contextToMap(ctx = {}) {
+        const map = new Map();
+        if (!ctx) return map;
+
+        if (Array.isArray(ctx)) {
+            for (const e of ctx) {
+                if (!e) continue;
+                if (typeof e.key !== 'string') continue;
+                const key = e.key.trim();
+                const val = Object.prototype.hasOwnProperty.call(e, 'value') ? e.value : (Object.prototype.hasOwnProperty.call(e, 'v') ? e.v : null);
+                map.set(key, val);
+            }
+            return map;
+        }
+
+        if (typeof ctx === 'object') {
+            for (const [k, v] of Object.entries(ctx)) {
+                if (k == null) continue;
+                map.set(String(k), v);
+            }
+        }
+        return map;
     }
 
-    #encodeKeys(context = {}, pipelineId = 'p', extension = null) {
-        const program = String(pipelineId || (context.programId || 'p'));
-        const ext = String(extension || (context.fileType || '')).replace(/^\./, '').toLowerCase() || (context.fileType || 'bin').replace(/^\./, '').toLowerCase();
-        const res = String(context.resolution || 'r');
-        const br = String(context.bitrate || 'b');
-        const cx = String(context.complexity || 'c');
-        const full = `${program}::${ext}::${res}::${br}::${cx}`;
-        const mid = `${program}::${ext}::${res}::ANY::${cx}`;
-        const coarse = `ANY::${ext}::ANY::ANY::${cx}`;
-        return [full, mid, coarse];
+    // Strict normalization: require exact pluginId and extension keys (no aliases)
+    // Returns { pluginId, extension, extras: Map }
+    #normalizeContextStrict(ctx = {}) {
+        const m = this.#contextToMap(ctx);
+
+        if (!m.has('pluginId')) throw new Error('context must include pluginId');
+        if (!m.has('extension')) throw new Error('context must include extension');
+
+        // normalize pluginId and extension
+        const pluginId = String(m.get('pluginId')).trim().toLowerCase();
+        const extension = String(m.get('extension')).replace(/^\./, '').toLowerCase();
+
+        // extras: everything except the two required keys
+        const extras = new Map();
+        for (const k of m.keys()) {
+            if (k === 'pluginId' || k === 'extension') continue;
+            extras.set(String(k), m.get(k));
+        }
+
+        return { pluginId, extension, extras };
+    }
+
+    // Deterministic serialization of extras map into "k=v;k2=v2" sorted by key
+    #serializeExtras(extrasMap) {
+        if (!extrasMap || !(extrasMap instanceof Map) || extrasMap.size === 0) return '';
+        const pairs = [];
+        for (const k of extrasMap.keys()) {
+            const v = extrasMap.get(k);
+            const ks = String(k).trim().toLowerCase();
+            const vs = (v === null || v === undefined) ? '' : String(v).trim();
+            const safeKey = ks.replace(/[:;]/g, (c) => (c === ':' ? '%3A' : '%3B'));
+            const safeVal = vs.replace(/[:;]/g, (c) => (c === ':' ? '%3A' : '%3B'));
+            pairs.push(`${safeKey}=${safeVal}`);
+        }
+        pairs.sort(); // critical: deterministic ordering
+        return pairs.join(';');
+    }
+
+    // Short stable hash utility (kept but not used by default)
+    #shortHashOfString(s) {
+        try {
+            const crypto = require('crypto');
+            return crypto.createHash('sha1').update(s).digest('hex').slice(0, 12);
+        } catch (e) {
+            let acc = 0;
+            for (let i = 0; i < s.length; i++) acc = (acc * 31 + s.charCodeAt(i)) >>> 0;
+            return acc.toString(36);
+        }
+    }
+
+    // Build canonical key: pluginId::extension::suffix (suffix or 'ANY')
+    #makeKeyStrict(context = {}) {
+        const { pluginId, extension, extras } = this.#normalizeContextStrict(context);
+        const extrasSerialized = this.#serializeExtras(extras);
+        if (!extrasSerialized) return `${pluginId}::${extension}::ANY`;
+        return `${pluginId}::${extension}::${extrasSerialized}`;
+    }
+
+    // encodeKeysStrict returns the exact hierarchy requested
+    #encodeKeysStrict(context = {}) {
+        const { pluginId, extension } = this.#normalizeContextStrict(context);
+        const full = this.#makeKeyStrict(context);
+        const pluginFallback = `${pluginId}::${extension}::ANY`;
+        const extFallback = `ANY::${extension}::ANY`;
+        const globalFallback = `ANY::ANY::ANY`;
+        return [full, pluginFallback, extFallback, globalFallback];
     }
 
     #getOrCreateModel(key) {
@@ -469,7 +544,7 @@ export default class IOProfile {
 
     // Internal predict with single cold-start path
     #predictInternal(context, S_in, S0) {
-        const keys = this.#encodeKeys(context, context.programId || 'p', context.fileType || context.extension || null);
+        const keys = this.#encodeKeysStrict(context);
         const { model, key } = this.#findModelForPredict(keys);
 
         if (!model || (model.n || 0) < this.#cfg.MIN_SAMPLES_COLD) {
