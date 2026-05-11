@@ -113,6 +113,10 @@ class ContextExtractor {
 
             const missing = this.#REQUIRED_FIELDS.filter(f => !this.#hasValue(flattened[f]));
 
+            if (i>0) {
+                flattened.filesize=null
+            }
+
             out.push({
                 isValid: missing.length === 0,
                 error: missing.length > 0 ? `Missing required fields: ${missing.join(', ')}` : null,
