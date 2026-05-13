@@ -1,3 +1,9 @@
+/**
+ * Register
+ *
+ * Tracks worker records, state machine, and indexes for quick queries.
+ * Provides strict state transitions and defensive guards.
+ */
 class Register {
     #registry;
     #pluginIndex;
@@ -28,6 +34,7 @@ class Register {
             set.delete(workerId);
             if (set.size === 0) indexMap.delete(key);
         }
+        return
     }
 
     #purgeWorker(workerId) {
@@ -59,7 +66,6 @@ class Register {
     createWorkerRecord(workerRecord) {
         const { workerId, pluginId, slotId } = workerRecord;
         
-        // Issue 3 fix: Explicit whitelisting/validation
         if (!workerId || !pluginId || slotId === undefined) {
             throw new Error('Incomplete worker record: workerId, pluginId, and slotId are required');
         }
@@ -112,11 +118,10 @@ class Register {
         worker.state = newState;
         worker.lastUsedAt = Date.now();
 
-        // Issue 2 fix: Core-level timestamp management
         if (newState === 'BUSY') {
             worker.metadata.assignedAt = Date.now();
         } else if (oldState === 'BUSY') {
-            // Issue 4 fix: Delete key instead of setting undefined
+
             delete worker.metadata.assignedAt;
         }
 
@@ -192,7 +197,11 @@ class Register {
 
         return Array.from(busyIds)
             .map(id => this.#registry.get(id))
-            .filter(w => (now - w.metadata.assignedAt) > timeoutMs)
+            .filter(w => {
+                const assignedAt = w?.metadata?.assignedAt;
+                if (!assignedAt || !Number.isFinite(assignedAt)) return false;
+                return (now - assignedAt) > timeoutMs;
+            })
             .map(w => this.getWorker(w.workerId));
     }
 

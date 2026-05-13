@@ -75,10 +75,8 @@ class SlotManager {
     // ===== ADD WORKER =====
     add(workerId, pluginId, isWarm = false) {
 
-        // Prevent duplicate assignment
-        if (this.#workerIndex.has(workerId)) {
-            return false;
-        }
+        if (!workerId || !pluginId) return null;
+        if (this.#workerIndex.has(workerId)) return null;
 
         const now = Date.now(); // Current timestamp
 
@@ -93,11 +91,13 @@ class SlotManager {
         // ===== WARM SLOT =====
         if (isWarm) {
 
-            if (this.#warmFreeSet.size === 0) return false;
+            if (this.#warmFreeSet.size === 0) {
+                this.#workers.delete(workerId);
+                return null;
+            }
 
             const slotId = this.#warmFreeSet.values().next().value;
 
-            // Assign slot
             this.#warmSlots.set(slotId, { workerId, pluginId });
 
             // Update tracking
@@ -109,18 +109,17 @@ class SlotManager {
 
             this.#assertInvariants();
 
-            return true;
+            return slotId;
         }
 
         // ===== WORKER SLOT =====
-        if (this.#workerFreeSet.size === 0) return false;
+        if (this.#workerFreeSet.size === 0) {
+            this.#workers.delete(workerId);
+            return null;
+        }
 
         const slotId = this.#workerFreeSet.values().next().value;
-
-        // Assign slot
         this.#workerSlots.set(slotId, { workerId, pluginId });
-
-        // Update tracking
         this.#workerFreeSet.delete(slotId);
         this.#workerIndex.set(workerId, { type: "worker", slotId });
 
@@ -129,7 +128,7 @@ class SlotManager {
 
         this.#assertInvariants();
 
-        return true;
+        return slotId;
     }
 
     // ===== FREE WORKER =====
@@ -164,6 +163,22 @@ class SlotManager {
         return true;
     }
 
+      /**
+     * Free a slot by numeric slotId. Convenience wrapper.
+     */
+    freeSlotById(slotId) {
+        if (this.#workerSlots.has(slotId)) {
+            const slot = this.#workerSlots.get(slotId);
+            if (!slot) return false;
+            return this.freeSlots(slot.workerId);
+        }
+        if (this.#warmSlots.has(slotId)) {
+            const slot = this.#warmSlots.get(slotId);
+            if (!slot) return false;
+            return this.freeSlots(slot.workerId);
+        }
+        return false;
+    }
     // ===== PROMOTE WARM → WORKER =====
     promote(workerId) {
 
@@ -176,6 +191,7 @@ class SlotManager {
         const warmSlotId = record.slotId;
 
         const slotData = this.#warmSlots.get(warmSlotId);
+        if (!slotData) return false;
         const pluginId = slotData.pluginId;
 
         // Remove from warm slot

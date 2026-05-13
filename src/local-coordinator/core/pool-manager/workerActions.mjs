@@ -50,25 +50,26 @@ class WorkerActions extends EventEmitter {
             stdoutBuffer: '', // Add these
             stderrBuffer: '',
             send: async (payload) => {
-
-                if (!child.stdin.writable) {
+                if (!child.stdin || !child.stdin.writable) {
                     return new ProjectError("Broken pipe: stdin not writable", { workerId, code: 'PIPE_CLOSED' });
                 }
 
                 const ok = child.stdin.write(JSON.stringify(payload) + "\n");
-
                 if (!ok) {
-
-                    return new Promise((resolve) => {
-                        child.stdin.once('drain', () => {
-                            console.log(`[Drain] Buffer cleared for ${workerId}`);
-                            resolve(true);
-                        });
+                    return new Promise((resolve, reject) => {
+                        const onDrain = () => {
+                        clearTimeout(drainTimer);
+                        resolve(true);
+                        };
+                        const drainTimer = setTimeout(() => {
+                            child.stdin.removeListener('drain', onDrain);
+                            reject(new ProjectError("stdin drain timeout", { workerId, code: 'PIPE_DRAIN_TIMEOUT' }));
+                        }, 5000);
+                        child.stdin.once('drain', onDrain);
                     });
                 }
-
-                    return true;
-                },
+                return true;
+            },
 
 
             kill: () => child.kill('SIGTERM'),
@@ -123,10 +124,10 @@ class WorkerActions extends EventEmitter {
             const entry = this.#data.get(workerId);
             
             if (entry) {
-                if (entry.stdoutBuffer.trim()) {
+                if (eentry.stdoutBuffer&&ntry.stdoutBuffer.trim()) {
                     this.emit('update', { type: 'RAW_LOG', workerId, data: entry.stdoutBuffer.trim() });
                 }
-                if (entry.stderrBuffer.trim()) {
+                if (entry.stderrBuffer&&entry.stderrBuffer.trim()) {
                     this.emit('update', { type: 'STDERR_LOG', workerId, data: entry.stderrBuffer.trim() });
                 }
             }
@@ -198,14 +199,18 @@ class WorkerActions extends EventEmitter {
         }
         if (!child) return;
         
-        if (child.pid) {
-            pidusage.unmonitor(child.pid);
-        }
+        try {
+            if (child.pid) {
+                try { pidusage.unmonitor(child.pid); } catch (_) { /* ignore */ }
+            }
+        } catch (_) { /* ignore */ }
 
-        child.stdout.removeAllListeners();
-        child.stderr.removeAllListeners();
-        child.stdin.removeAllListeners();
-        child.removeAllListeners();
+        try {
+            child.stdout?.removeAllListeners();
+            child.stderr?.removeAllListeners();
+            child.stdin?.removeAllListeners();
+            child.removeAllListeners();
+            } catch (_) { /* ignore */ }
 
         if (child.stdin.writable) child.stdin.end();
         this.#data.delete(workerId);
@@ -347,6 +352,3 @@ function logError(err) {
     console.error(report);
 
 }
-
-
-export { WorkerActions, ProjectError, logError };

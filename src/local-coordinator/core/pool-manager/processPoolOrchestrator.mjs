@@ -35,15 +35,13 @@ import {
 
 class ProcessPoolOrchestrator {
 
-    // ── Components ───────────────────────────────────────────────────────────
+    // Components
     #register;
     #slots;
     #memory;
     #actions;
 
-    // ── Event bridge to Runtime Scheduler ────────────────────────────────────
-    // All lifecycle events are forwarded here. The Runtime Scheduler registers
-    // this callback and owns all decision-making in response to events.
+    // Event bridge to Runtime Scheduler
     #onEvent;
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -62,55 +60,85 @@ class ProcessPoolOrchestrator {
         }
 
         this.#register = new Register();
-        this.#slots    = new SlotManager(config.slots  ?? {});
+        this.#slots    = new SlotManager(config.slots ?? {});
         this.#memory   = new MemoryController(config.memory ?? {});
-        this.#actions  = new WorkerActions(config.cwd  ?? process.cwd());
+        this.#actions  = new WorkerActions(config.cwd ?? process.cwd());
         this.#onEvent  = onEvent;
+
+        // Intent dedupe cache (short-lived)
+        this.#intentCache = new Map();
+        this.#intentTTLMs = config.intentTTLMs ?? 60_000;
 
         // Wire WorkerActions event stream
         this.#actions.on("update", (event) => this.#handle(event));
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // PUBLIC API
-    // ─────────────────────────────────────────────────────────────────────────
+    // ----------------- Helpers -----------------
+
+    #dedupeIntent(intentId) {
+        if (!intentId) return null;
+        const entry = this.#intentCache.get(intentId);
+        const now = Date.now();
+        if (entry && (now - entry.ts) < this.#intentTTLMs) {
+            return entry.result;
+        }
+        // Reserve placeholder
+        this.#intentCache.set(intentId, { result: { status: 'IN_PROGRESS' }, ts: now });
+        return null;
+    }
+
+    #storeIntentResult(intentId, result) {
+        if (!intentId) return;
+        this.#intentCache.set(intentId, { result, ts: Date.now() });
+        setTimeout(() => {
+            const e = this.#intentCache.get(intentId);
+            if (e && (Date.now() - e.ts) >= this.#intentTTLMs) this.#intentCache.delete(intentId);
+        }, this.#intentTTLMs + 1000);
+    }
+
+    #emit(type, payload = {}, intentId = null) {
+        try {
+            const envelope = { type, timestamp: Date.now(), ...payload };
+            if (intentId) envelope.intentId = intentId;
+            this.#onEvent(envelope);
+        } catch (err) {
+            console.error(`[ProcessPoolOrchestrator] onEvent threw for ${type}: ${err.message}`);
+        }
+    }
+
+    // Backwards-compatible helper: if SlotManager.add() returns numeric slotId, use it.
+    #getSlotIdFromAddResult(addResult, workerId) {
+        if (typeof addResult === 'number') return addResult;
+        try {
+            if (typeof this.#slots.getSlotIdForWorker === 'function') {
+                return this.#slots.getSlotIdForWorker(workerId);
+            }
+        } catch (err) {
+            // ignore
+        }
+        return null;
+    }
+
+    // ----------------- Public API -----------------
 
     /**
-     * Evaluate whether a spawn is memory-safe without committing anything.
-     * The Runtime Scheduler calls this before deciding whether to spawn.
-     *
-     * @param {object} pluginProfile - { base_overhead_mb, variable_per_mb }
-     * @param {number} fileSizeMB
-     * @param {object} snapshot      - { total_memory_mb, mem_available_mb, mem_free_mb }
-     * @param {object} [feedback]    - { peak_base_overhead_mb, peak_variable_per_mb }
-     * @returns {{ decision: "ACCEPT"|"REJECT", reason: string|null, ...meta }}
+     * Memory evaluation wrapper.
+     * Uses MemoryController.evaluateCombined(baseOverheadMB, fullRequiredMB, snapshot)
      */
     evaluateMemory(pluginProfile, fileSizeMB, snapshot, feedback = {}) {
-        return this.#memory.evaluate(
-            { file_size: fileSizeMB },
-            pluginProfile,
-            snapshot,
-            feedback
-        );
+        const base = pluginProfile?.base_overhead_mb ?? pluginProfile?.baseOverheadMB ?? 0;
+        const full = Number(fileSizeMB ?? 0);
+        return this.#memory.evaluateCombined(base, full, snapshot);
     }
 
     /**
-     * Spawn a new worker process.
+     * Spawn a new worker process (atomic).
+     * - claims numeric slotId from SlotManager.add()
+     * - registers worker record with numeric slotId
+     * - advances to STARTING
+     * - calls WorkerActions.create()
      *
-     * Preconditions the caller (Runtime Scheduler) must have already verified:
-     *   - evaluateMemory() returned ACCEPT
-     *   - a free slot exists (hasFreeWorkerSlot() or hasFreeWarmSlot())
-     *
-     * This method claims the slot, registers the worker, and starts the
-     * process. It is intentionally not guarded by memory checks here —
-     * the Runtime Scheduler owns that gate. Calling spawn() without
-     * passing the memory gate first is a programming error and will throw.
-     *
-     * @param {string}  workerId
-     * @param {object}  pluginData   - { pluginId, cmd, args? }
-     * @param {boolean} [isWarm]     - true for pre-warm slot
-     * @param {object}  [spawnConfig]- { initTimeout? } forwarded to WorkerActions
-     * @returns {true} — throws on any failure
+     * Throws ProjectError on failure.
      */
     spawn(workerId, pluginData, isWarm = false, spawnConfig = {}) {
         const { pluginId, cmd } = pluginData;
@@ -130,46 +158,41 @@ class ProcessPoolOrchestrator {
             );
         }
 
-        // ── 1. Claim slot ─────────────────────────────────────────────────
-        const slotClaimed = this.#slots.add(workerId, pluginId, isWarm);
-        if (!slotClaimed) {
+        // 1) Claim slot
+        const addResult = this.#slots.add(workerId, pluginId, isWarm);
+        const slotId = this.#getSlotIdFromAddResult(addResult, workerId);
+        if (slotId === null || slotId === undefined) {
             throw new ProjectError(
                 `No ${isWarm ? "warm" : "worker"} slot available for ${workerId}`,
                 { code: "NO_SLOT_AVAILABLE", workerId }
             );
         }
 
-        // ── 2. Register worker record ─────────────────────────────────────
-        // slotId uses workerId as the key — SlotManager owns physical slot IDs
-        // internally via its reverse index. Register's slotIndex collision
-        // detection uses this same workerId string as the slot key.
+        // 2) Register worker record with numeric slotId
         try {
-            this.#register.createWorkerRecord({ workerId, pluginId, slotId: workerId });
+            this.#register.createWorkerRecord({ workerId, pluginId, slotId });
         } catch (err) {
-            // Registration failed — release the slot we just claimed
-            this.#slots.freeSlots(workerId);
+            try { this.#slots.freeSlots(workerId); } catch (_) { /* ignore */ }
             throw new ProjectError(
                 `Registry failure for ${workerId}: ${err.message}`,
                 { code: "REGISTRY_FAILURE", workerId }
             );
         }
 
-        // ── 3. Advance to STARTING ────────────────────────────────────────
-        // CREATED → STARTING signals the OS spawn is in progress.
-        // Prevents the worker being dispatched before it reaches IDLE.
+        // 3) Advance to STARTING
         try {
             this.#register.updateState(workerId, "STARTING");
         } catch (err) {
             // Should never happen — CREATED → STARTING is always valid
             this.#cleanupRecord(workerId);
-            this.#slots.freeSlots(workerId);
+            try { this.#slots.freeSlots(workerId); } catch (_) { /* ignore */ }
             throw new ProjectError(
                 `State transition failure pre-spawn: ${err.message}`,
                 { code: "STATE_TRANSITION_FAILURE", workerId }
             );
         }
 
-        // ── 4. Spawn the OS process ───────────────────────────────────────
+        // 4) Spawn OS process
         const spawnResult = this.#actions.create(
             workerId,
             pluginData,
@@ -178,13 +201,14 @@ class ProcessPoolOrchestrator {
         );
 
         if (spawnResult instanceof ProjectError) {
-            // create() failed synchronously (PID_MISSING etc.)
-            // WorkerActions already emitted ERROR — #handle will drive cleanup.
-            // Surface the error immediately so the caller knows.
+            // Force cleanup to ensure slot and registry consistency
+            try { this.#forceCleanup(workerId, "CREATE_SYNC_FAILURE"); } catch (_) { /* ignore */ }
             logError(spawnResult);
             throw spawnResult;
         }
 
+        // Spawn initiated
+        this.#emit("WORKER_SPAWN_INITIATED", { workerId, pluginId, slotId });
         return true;
     }
 
@@ -259,6 +283,7 @@ class ProcessPoolOrchestrator {
      * @param {number} [gracefulMs=5000]
      * @returns {true} — throws if worker not found
      */
+
     terminateWorker(workerId, gracefulMs = 5_000) {
         const worker = this.#register.getWorker(workerId);
         if (!worker) {
@@ -269,11 +294,7 @@ class ProcessPoolOrchestrator {
 
         // Signal intent — prevents new task assignment while waiting for exit
         if (worker.state !== "TERMINATING") {
-            try {
-                this.#register.terminate(workerId);
-            } catch {
-                // Already transitioning — not an error
-            }
+            try { this.#register.terminate(workerId); } catch { /* ignore */ }
         }
 
         const killResult = this.#actions.kill(workerId, gracefulMs);
@@ -281,7 +302,6 @@ class ProcessPoolOrchestrator {
             // Process already gone — CLOSED will not arrive, drive cleanup now
             this.#forceCleanup(workerId, "PROCESS_ALREADY_GONE");
         }
-        // Otherwise CLOSED event will fire and drive forceCleanup
 
         return true;
     }
@@ -299,81 +319,51 @@ class ProcessPoolOrchestrator {
         return true;
     }
 
-    /**
-     * Terminate all live workers. Used during system shutdown.
-     */
     killAll() {
         this.#actions.killAll();
     }
 
-    /**
-     * Release pidusage monitoring. Call during shutdown after killAll().
-     */
     unmonitorAll() {
         this.#actions.unmonitorAll();
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // READ API — state introspection for Runtime Scheduler
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /** @returns {object|null} deep clone of worker record */
+    // Read APIs
     getWorker(workerId) {
         return this.#register.getWorker(workerId);
     }
 
-    /** @returns {{ CREATED?, STARTING?, IDLE?, BUSY?, WARM?, TERMINATING? }} */
     getStateCounts() {
         return this.#register.getStateCounts();
     }
 
-    /** @returns {{ worker: { total, free, used }, warm: { total, free, used } }} */
     getSlotStats() {
         return this.#slots.slotStats();
     }
 
-    /** @returns {boolean} */
     hasFreeWorkerSlot() {
         return this.#slots.freeWorkerSlot > 0;
     }
 
-    /** @returns {boolean} */
     hasFreeWarmSlot() {
         return this.#slots.freeWarmSlot > 0;
     }
 
-    /**
-     * Collect live CPU/memory stats for a set of workers via pidusage.
-     *
-     * @param {string[]} workerIds
-     * @returns {Promise<object>} — throws on metric failure
-     */
     async getResourceSnapshot(workerIds) {
         const result = await this.#actions.resource(workerIds);
         if (result instanceof ProjectError) throw result;
         return result;
     }
 
-    /**
-     * Return BUSY workers whose assignedAt exceeds timeoutMs.
-     * The Runtime Scheduler uses this to detect stalls and decide action.
-     *
-     * @param {number} timeoutMs
-     * @returns {object[]} array of worker record clones
-     */
     getStalledWorkers(timeoutMs) {
         return this.#register.getStalledWorkers(timeoutMs);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // INTERNAL — WorkerActions event router
-    // ─────────────────────────────────────────────────────────────────────────
+    // ----------------- WorkerActions event router -----------------
 
     #handle(event) {
         const { type, workerId } = event;
 
-        // SPAWNED arrives before we have confirmed STARTING in some race
-        // windows. All other events expect a live record.
+        // SPAWNED arrives before we have confirmed STARTING in some race windows.
         const worker = this.#register.getWorker(workerId);
         if (!worker && type !== "SPAWNED") {
             // Stale event for an already-purged worker — safe to discard
@@ -396,9 +386,7 @@ class ProcessPoolOrchestrator {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // INTERNAL — individual event handlers
-    // ─────────────────────────────────────────────────────────────────────────
+    // Event handlers
 
     /**
      * OS confirmed the process started.
@@ -414,7 +402,6 @@ class ProcessPoolOrchestrator {
         }
 
         if (worker.state !== "STARTING") {
-            // Another event already moved the state (SPAWN_TIMEOUT race).
             this.#emit("SPAWN_RACE_DISCARDED", {
                 workerId, currentState: worker.state,
             });
@@ -422,8 +409,8 @@ class ProcessPoolOrchestrator {
         }
 
         try {
-            // Check the slot type to determine warm vs active transition
-            const slotMeta = this.#slots.getWorker(workerId);
+            // Determine warm vs active by SlotManager metadata if available
+            const slotMeta = (typeof this.#slots.getWorker === 'function') ? this.#slots.getWorker(workerId) : null;
             const isWarm   = slotMeta?.state === "WARM";
 
             if (isWarm) {
@@ -449,11 +436,6 @@ class ProcessPoolOrchestrator {
         }
     }
 
-    /**
-     * initTimeout expired before 'spawn' OS event fired.
-     * WorkerActions already sent SIGKILL.
-     * Cleanup records and report — Runtime Scheduler decides on retry.
-     */
     #onSpawnTimeout(workerId, event) {
         const worker = this.#register.getWorker(workerId);
 
@@ -466,10 +448,6 @@ class ProcessPoolOrchestrator {
         this.#forceCleanup(workerId, "SPAWN_TIMEOUT");
     }
 
-    /**
-     * Valid JSON received on stdout — plugin-level status signal.
-     * Pass through to Runtime Scheduler unchanged.
-     */
     #onRuntimeUpdate(workerId, event) {
         this.#emit("WORKER_UPDATE", {
             workerId,
@@ -499,32 +477,21 @@ class ProcessPoolOrchestrator {
         });
 
         if (worker.state !== "TERMINATING") {
-            try { this.#register.terminate(workerId); } catch { /* already terminating */ }
+            try { this.#register.terminate(workerId); } catch { /* ignore */ }
         }
 
         const killResult = this.#actions.kill(workerId, 5_000);
         if (killResult instanceof ProjectError) {
-            // Process already gone — CLOSED will not arrive
             this.#forceCleanup(workerId, "RUNTIME_ERROR_PROCESS_GONE");
         }
     }
 
-    /**
-     * OS-level error (ENOENT, EACCES, EPIPE, etc.).
-     * WorkerActions already ran cleanup() internally.
-     * Clean our records and report.
-     */
     #onOsError(workerId, event) {
         if (event.err) logError(event.err);
         this.#emit("WORKER_OS_ERROR", { workerId, err: event.err });
         this.#forceCleanup(workerId, "OS_ERROR");
     }
 
-    /**
-     * stdin pipe broken or PID missing after spawn.
-     * WorkerActions sends SIGKILL and calls cleanup() — CLOSED will follow.
-     * Mark TERMINATING now to block new task dispatch.
-     */
     #onError(workerId, event) {
         const worker = this.#register.getWorker(workerId);
         if (!worker) return;
@@ -534,9 +501,8 @@ class ProcessPoolOrchestrator {
         this.#emit("WORKER_COMM_ERROR", { workerId, err: event.err });
 
         if (worker.state !== "TERMINATING") {
-            try { this.#register.terminate(workerId); } catch { /* already transitioning */ }
+            try { this.#register.terminate(workerId); } catch { /* ignore */ }
         }
-        // CLOSED event drives final cleanup
     }
 
     /**
@@ -576,23 +542,26 @@ class ProcessPoolOrchestrator {
         this.#emit("WORKER_LOG", { workerId, level: "warn", data: event.data });
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // INTERNAL — cleanup pipeline
-    // ─────────────────────────────────────────────────────────────────────────
+    // ----------------- Cleanup pipeline -----------------
 
-    /**
-     * Atomic cleanup: release slot + purge Register record in one step.
-     * This is the ONLY place that calls both freeSlots() and cleanupRecord()
-     * together, ensuring SlotManager and Register are always in sync.
-     *
-     * Safe to call multiple times — both components guard against
-     * double-release internally.
-     */
     #forceCleanup(workerId, reason) {
         const worker = this.#register.getWorker(workerId);
 
-        this.#slots.freeSlots(workerId);    // idempotent — returns false if already free
-        this.#cleanupRecord(workerId);      // idempotent — returns early if already purged
+        // Prefer freeing by workerId (idempotent). If that fails, try freeing by discovered slotId.
+        try {
+            this.#slots.freeSlots(workerId);
+        } catch (err) {
+            try {
+                const slotId = (typeof this.#slots.getSlotIdForWorker === 'function')
+                    ? this.#slots.getSlotIdForWorker(workerId)
+                    : null;
+                if (slotId !== null && typeof this.#slots.freeSlotById === 'function') {
+                    this.#slots.freeSlotById(slotId);
+                }
+            } catch (_) { /* ignore */ }
+        }
+
+        this.#cleanupRecord(workerId);
 
         this.#emit("WORKER_DEAD", {
             workerId,
@@ -607,18 +576,16 @@ class ProcessPoolOrchestrator {
      */
     #cleanupRecord(workerId) {
         const worker = this.#register.getWorker(workerId);
-        if (!worker) return; // Already purged
+        if (!worker) return;
 
         try {
             const { state } = worker;
 
             if (state === "CREATED" || state === "STARTING" || state === "TERMINATING") {
-                // All have valid DEAD transitions
                 this.#register.markDead(workerId);
             } else if (state === "DEAD") {
-                // Nothing to do
+                // nothing
             } else {
-                // IDLE, BUSY, WARM — must pass through TERMINATING
                 this.#register.terminate(workerId);
                 this.#register.markDead(workerId);
             }
@@ -651,7 +618,6 @@ class ProcessPoolOrchestrator {
 }
 
 export default ProcessPoolOrchestrator;
-
 
 
 /* 
