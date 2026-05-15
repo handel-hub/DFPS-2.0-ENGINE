@@ -7,480 +7,591 @@ import {
     logError,
 } from "./index.mjs";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ProcessPoolOrchestrator
-//
-// Responsibility: coordinate SlotManager, Register, MemoryController, and
-// WorkerActions into a single coherent execution surface.
-//
-// What this layer owns:
-//   - Translating spawn requests into the correct sequence of component calls
-//   - Keeping SlotManager and Register in sync on every lifecycle transition
-//   - Routing WorkerActions events to the correct state transitions
-//   - Performing structural cleanup when a worker exits for any reason
-//   - Exposing a clean read/write API to the Runtime Scheduler above
-//
-// What this layer does NOT own:
-//   - Retry decisions        → Runtime Scheduler
-//   - Deferred queue         → Runtime Scheduler
-//   - Stall detection        → Runtime Scheduler
-//   - Task dispatch logic    → Runtime Scheduler
-//   - Memory snapshot reads  → caller supplies snapshot at spawn time
-//
-// Cooperation contract with Runtime Scheduler:
-//   Every significant lifecycle event is reported upward via the onEvent
-//   callback. The Runtime Scheduler reacts to these events and decides
-//   whether to retry, reassign, escalate, or discard.
-// ─────────────────────────────────────────────────────────────────────────────
+
 
 class ProcessPoolOrchestrator {
-
-    // Components
     #register;
     #slots;
     #memory;
     #actions;
-
-    // Event bridge to Runtime Scheduler
     #onEvent;
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Constructor
-    //
-    // @param {object}   config           - component configuration
-    // @param {object}   config.slots     - SlotManager config (workerSlot, warmSlot)
-    // @param {object}   config.memory    - MemoryController config (safetyMarginMB)
-    // @param {string}   config.cwd       - working directory for spawned processes
-    // @param {Function} onEvent          - Runtime Scheduler event callback
-    //                                     receives: { type, workerId, ...payload }
-    // ─────────────────────────────────────────────────────────────────────────
+    #_tempClaims;
+
     constructor(config = {}, onEvent) {
         if (typeof onEvent !== "function") {
             throw new Error("ProcessPoolOrchestrator requires an onEvent callback");
         }
 
+        this.config = {
+            claimTTLMs: Number(config.claimTTLMs ?? 30_000),
+            spawnInitTimeout: Number(config.spawnInitTimeout ?? 10_000),
+            killGraceMs: Number(config.killGraceMs ?? 5_000),
+
+            sendTimeoutMs: Number(config.sendTimeoutMs ?? 5_000),
+            maxSendAttempts: Number(config.maxSendAttempts ?? 2),
+            sendRetryDelayMs: Number(config.sendRetryDelayMs ?? 150),
+            failOnSendError: Boolean(config.failOnSendError ?? false),
+        };
+
         this.#register = new Register();
-        this.#slots    = new SlotManager(config.slots ?? {});
-        this.#memory   = new MemoryController(config.memory ?? {});
-        this.#actions  = new WorkerActions(config.cwd ?? process.cwd());
-        this.#onEvent  = onEvent;
+        this.#slots = new SlotManager(config.slots ?? {});
+        this.#memory = new MemoryController(config.memory ?? {});
+        this.#actions = new WorkerActions(config.cwd ?? process.cwd());
+        this.#onEvent = onEvent;
 
-        // Intent dedupe cache (short-lived)
-        this.#intentCache = new Map();
-        this.#intentTTLMs = config.intentTTLMs ?? 60_000;
+        this.#_tempClaims = new Map();
 
-        // Wire WorkerActions event stream
         this.#actions.on("update", (event) => this.#handle(event));
     }
 
-    // ----------------- Helpers -----------------
-
-    #dedupeIntent(intentId) {
-        if (!intentId) return null;
-        const entry = this.#intentCache.get(intentId);
-        const now = Date.now();
-        if (entry && (now - entry.ts) < this.#intentTTLMs) {
-            return entry.result;
-        }
-        // Reserve placeholder
-        this.#intentCache.set(intentId, { result: { status: 'IN_PROGRESS' }, ts: now });
-        return null;
-    }
-
-    #storeIntentResult(intentId, result) {
-        if (!intentId) return;
-        this.#intentCache.set(intentId, { result, ts: Date.now() });
-        setTimeout(() => {
-            const e = this.#intentCache.get(intentId);
-            if (e && (Date.now() - e.ts) >= this.#intentTTLMs) this.#intentCache.delete(intentId);
-        }, this.#intentTTLMs + 1000);
-    }
-
-    #emit(type, payload = {}, intentId = null) {
+    // ---------------- Event emitter wrapper ----------------
+    #emit(type, payload = {}) {
         try {
-            const envelope = { type, timestamp: Date.now(), ...payload };
-            if (intentId) envelope.intentId = intentId;
-            this.#onEvent(envelope);
+            this.#onEvent({ type, timestamp: Date.now(), ...payload });
         } catch (err) {
-            console.error(`[ProcessPoolOrchestrator] onEvent threw for ${type}: ${err.message}`);
+
+            console.error(`[ProcessPoolOrchestrator] onEvent threw for ${type}: ${err?.message}`);
         }
     }
 
-    // Backwards-compatible helper: if SlotManager.add() returns numeric slotId, use it.
-    #getSlotIdFromAddResult(addResult, workerId) {
-        if (typeof addResult === 'number') return addResult;
+    #emitMetric(name, value = 1, tags = {}) {
+
+        this.#emit("METRIC", { name, value, ...tags });
+    }
+
+    // ---------------- Public API (synchronous validation only) ----------------
+
+    /**
+     * runTask(task)
+     * - task: { taskId, pluginId, filePath, memorySnapshot?, memoryProfile?, caller? }
+     * Returns: "ACCEPTED" | "REJECTED"
+     *
+     * Emits:
+     *  - WORKER_ASSIGNED when assignment happens
+     *  - NEED_PLUGIN_INSTANCE when no idle worker exists
+     *  - WORKER_REJECTED_MEMORY when memory gate fails
+     */
+    runTask(task = {}) {
+        const { taskId, pluginId, filePath, memorySnapshot, memoryProfile = {}, caller } = task;
+        if (!taskId || !pluginId || !filePath) {
+            return "REJECTED";
+        }
+
         try {
-            if (typeof this.#slots.getSlotIdForWorker === 'function') {
-                return this.#slots.getSlotIdForWorker(workerId);
+            if (memorySnapshot) {
+                const base = memoryProfile.base_overhead_mb ?? memoryProfile.baseOverheadMB ?? 0;
+                const full = memoryProfile.full_required_mb ?? memoryProfile.fullRequiredMB ?? 0;
+                const decision = this.#memory.evaluateCombined(base, full, memorySnapshot);
+                if (decision.decision !== "ACCEPT") {
+                    this.#emit("WORKER_REJECTED_MEMORY", { taskId, pluginId, reason: decision.reason, caller });
+                    this.#emitMetric("worker.rejected.memory", 1, { pluginId });
+                    return "REJECTED";
+                }
             }
         } catch (err) {
-            // ignore
-        }
-        return null;
-    }
-
-    // ----------------- Public API -----------------
-
-    /**
-     * Memory evaluation wrapper.
-     * Uses MemoryController.evaluateCombined(baseOverheadMB, fullRequiredMB, snapshot)
-     */
-    evaluateMemory(pluginProfile, fileSizeMB, snapshot, feedback = {}) {
-        const base = pluginProfile?.base_overhead_mb ?? pluginProfile?.baseOverheadMB ?? 0;
-        const full = Number(fileSizeMB ?? 0);
-        return this.#memory.evaluateCombined(base, full, snapshot);
-    }
-
-    /**
-     * Spawn a new worker process (atomic).
-     * - claims numeric slotId from SlotManager.add()
-     * - registers worker record with numeric slotId
-     * - advances to STARTING
-     * - calls WorkerActions.create()
-     *
-     * Throws ProjectError on failure.
-     */
-    spawn(workerId, pluginData, isWarm = false, spawnConfig = {}) {
-        const { pluginId, cmd } = pluginData;
-
-        if (!workerId || !pluginId || !cmd) {
-            throw new ProjectError(
-                "spawn() requires workerId, pluginData.pluginId, and pluginData.cmd",
-                { code: "INVALID_SPAWN_ARGS", workerId }
-            );
+            logError(new ProjectError(`Memory evaluation failed: ${err?.message}`, { code: "MEMORY_EVAL", workerId: taskId }));
+            return "REJECTED";
         }
 
-        // Guard: duplicate workerId
-        if (this.#register.getWorker(workerId)) {
-            throw new ProjectError(
-                `Worker ${workerId} already exists in registry`,
-                { code: "DUPLICATE_WORKER", workerId }
-            );
-        }
-
-        // 1) Claim slot
-        const addResult = this.#slots.add(workerId, pluginId, isWarm);
-        const slotId = this.#getSlotIdFromAddResult(addResult, workerId);
-        if (slotId === null || slotId === undefined) {
-            throw new ProjectError(
-                `No ${isWarm ? "warm" : "worker"} slot available for ${workerId}`,
-                { code: "NO_SLOT_AVAILABLE", workerId }
-            );
-        }
-
-        // 2) Register worker record with numeric slotId
         try {
-            this.#register.createWorkerRecord({ workerId, pluginId, slotId });
+            const idleWorkerId = this.#register.findIdleWorker(pluginId);
+            if (idleWorkerId) {
+
+                this.assignTask(idleWorkerId, { taskId, filePath, pluginId });
+                this.#emit("WORKER_ASSIGNED", { workerId: idleWorkerId, taskId, pluginId, caller });
+                this.#emitMetric("worker.assigned", 1, { pluginId });
+                return "ACCEPTED";
+            }
+
+            this.#emit("NEED_PLUGIN_INSTANCE", { taskId, pluginId, caller });
+            this.#emitMetric("need.plugin.instance", 1, { pluginId });
+            return "ACCEPTED";
         } catch (err) {
-            try { this.#slots.freeSlots(workerId); } catch (_) { /* ignore */ }
-            throw new ProjectError(
-                `Registry failure for ${workerId}: ${err.message}`,
-                { code: "REGISTRY_FAILURE", workerId }
-            );
+            logError(new ProjectError(`runTask failed: ${err?.message}`, { code: "RUN_TASK_FAIL", workerId: taskId }));
+            return "REJECTED";
+        }
+    }
+
+    /**
+     * ensurePluginReady(pluginId, options)
+     * - options: { isWarm = true, snapshot?, base_overhead_mb?, cmd?, caller? }
+     * Returns: "ACCEPTED" | "REJECTED"
+     *
+     * Behavior:
+     *  - If IDLE/WARM exists, emit WORKER_READY/WORKER_WARM_READY and return ACCEPTED.
+     *  - Try promote warm -> worker if possible.
+     *  - Otherwise claim a warm slot with TTL and emit WORKER_SLOT_CLAIMED { slotId, tempKey, pluginId }.
+     *    Scheduler must call bindWorkerToSlot(workerId, slotId, pluginData) to continue spawn.
+     */
+    ensurePluginReady(pluginId, options = {}) {
+        const { isWarm = true, snapshot, base_overhead_mb = 0, cmd, caller } = options;
+        if (!pluginId) return "REJECTED";
+
+        const workers = this.#register.getWorkersByPlugin(pluginId);
+        for (const w of workers) {
+            if (!w) continue;
+            if (w.state === "IDLE") {
+                this.#emit("WORKER_READY", { workerId: w.workerId, pluginId, caller });
+                return "ACCEPTED";
+            }
+            if (w.state === "WARM") {
+                this.#emit("WORKER_WARM_READY", { workerId: w.workerId, pluginId, caller });
+                return "ACCEPTED";
+            }
         }
 
-        // 3) Advance to STARTING
+        const warmCandidate = workers.find(w => w && w.state === "WARM");
+        if (warmCandidate) {
+            try {
+                const promoted = this.#slots.promote(warmCandidate.workerId);
+                if (promoted) {
+
+                    this.#register.promoteWarm(warmCandidate.workerId);
+                    this.#emit("WORKER_PROMOTED", { workerId: warmCandidate.workerId, pluginId, caller });
+                    this.#emit("WORKER_READY", { workerId: warmCandidate.workerId, pluginId, caller });
+                    this.#emitMetric("worker.promoted", 1, { pluginId });
+                    return "ACCEPTED";
+                }
+            } catch (err) {
+                logError(new ProjectError(`promoteWarm failed: ${err?.message}`, { workerId: warmCandidate.workerId }));
+
+            }
+        }
+
         try {
-            this.#register.updateState(workerId, "STARTING");
+            if (snapshot) {
+                const memDecision = this.#memory.evaluatePlugin(base_overhead_mb, snapshot);
+                if (memDecision.decision !== "ACCEPT") {
+                    this.#emit("WORKER_SPAWN_REJECTED_MEMORY", { pluginId, reason: memDecision.reason, caller });
+                    this.#emitMetric("worker.spawn.rejected.memory", 1, { pluginId });
+                    return "REJECTED";
+                }
+            }
         } catch (err) {
-            // Should never happen — CREATED → STARTING is always valid
-            this.#cleanupRecord(workerId);
-            try { this.#slots.freeSlots(workerId); } catch (_) { /* ignore */ }
-            throw new ProjectError(
-                `State transition failure pre-spawn: ${err.message}`,
-                { code: "STATE_TRANSITION_FAILURE", workerId }
-            );
+            logError(new ProjectError(`memory evaluatePlugin failed: ${err?.message}`, { code: "MEM_EVAL" }));
+            return "REJECTED";
         }
 
-        // 4) Spawn OS process
-        const spawnResult = this.#actions.create(
-            workerId,
-            pluginData,
-            { flag: false },
-            { initTimeout: spawnConfig.initTimeout ?? 10_000 }
-        );
+        const claim = this._claimWarmSlotWithTimeout(pluginId);
+        if (!claim) {
 
-        if (spawnResult instanceof ProjectError) {
-            // Force cleanup to ensure slot and registry consistency
-            try { this.#forceCleanup(workerId, "CREATE_SYNC_FAILURE"); } catch (_) { /* ignore */ }
-            logError(spawnResult);
-            throw spawnResult;
+            this.#emit("WORKER_SPAWN_REJECTED_NO_SLOT", { pluginId, caller });
+            this.#emitMetric("worker.spawn.rejected.no_slot", 1, { pluginId });
+            return "REJECTED";
         }
 
-        // Spawn initiated
-        this.#emit("WORKER_SPAWN_INITIATED", { workerId, pluginId, slotId });
-        return true;
+        this.#emit("WORKER_SLOT_CLAIMED", { slotId: claim.slotId, pluginId, tempKey: claim.tempKey, caller });
+        this.#emitMetric("worker.slot.claimed", 1, { pluginId });
+        return "ACCEPTED";
     }
 
     /**
-     * Mark a READY (IDLE) worker as busy with a task.
-     * Strictly a Register state transition — does not touch WorkerActions.
+     * bindWorkerToSlot(workerId, slotId, pluginData = {})
      *
-     * @param {string} workerId
-     * @param {object} taskData - task metadata (taskId, filePath, etc.)
-     * @returns {true} — throws on invalid state or unknown worker
+     * - Validates the slot was claimed and still held by the tempKey.
+     * - Atomically binds workerId into the pool (best-effort).
+     * - Creates Register record and advances to STARTING, then calls WorkerActions.create().
+     *
+     * Returns: "ACCEPTED" | "REJECTED"
      */
-    assignTask(workerId, taskData = {}) {
-        this.#register.assignWork(workerId, taskData);
-        return true;
+    bindWorkerToSlot(workerId, slotId, pluginData = {}, caller) {
+        if (!workerId || slotId === undefined || !pluginData?.pluginId) {
+            return "REJECTED";
+        }
+
+        const pluginId = pluginData.pluginId;
+
+        const entry = Array.from(this.#_tempClaims.entries()).find(([, v]) => v.slotId === slotId);
+        if (!entry) {
+            this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId, pluginId, reason: "SLOT_NOT_CLAIMED", caller });
+            return "REJECTED";
+        }
+
+        const [tempKey, claim] = entry;
+
+        this._cancelClaim(tempKey);
+
+        try {
+            const tempSlotId = this.#slots.getSlotIdForWorker(tempKey);
+            if (tempSlotId !== slotId) {
+
+                this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId, pluginId, reason: "TEMPKEY_MISMATCH", caller });
+                return "REJECTED";
+            }
+        } catch (err) {
+
+            logError(new ProjectError(`Slot validation warning: ${err?.message}`, { workerId }));
+        }
+
+        // Attempt to atomically replace tempKey occupant with workerId.
+        // Because SlotManager doesn't expose direct slot assignment, we free tempKey and add workerId.
+        // This may result in a different numeric slotId being assigned; we capture it and proceed.
+        try {
+            // Free the tempKey occupant
+            try { this.#slots.freeSlots(tempKey); } catch (_) { /* ignore */ }
+
+            const newSlotId = this.#slots.add(workerId, pluginId, false);
+            if (newSlotId === null || newSlotId === undefined) {
+
+                try { this.#slots.add(tempKey, claim.pluginId ?? pluginId, true); } catch (_) { /* ignore */ }
+                this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId, pluginId, reason: "NO_WORKER_SLOT_AVAILABLE", caller });
+                return "REJECTED";
+            }
+
+            try {
+                this.#register.createWorkerRecord({ workerId, pluginId, slotId: newSlotId });
+            } catch (err) {
+
+                try { this.#slots.freeSlots(workerId); } catch (_) { /* ignore */ }
+                try { this.#slots.add(tempKey, claim.pluginId ?? pluginId, true); } catch (_) { /* ignore */ }
+                logError(new ProjectError(`createWorkerRecord failed: ${err?.message}`, { workerId }));
+                this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId: newSlotId, pluginId, reason: "REGISTRY_FAILURE", caller });
+                return "REJECTED";
+            }
+
+            this.#emit("WORKER_REGISTERED", { workerId, slotId: newSlotId, pluginId, caller });
+
+            // Advance to STARTING
+            try {
+                this.#register.updateState(workerId, "STARTING");
+            } catch (err) {
+                // cleanup and report
+                this.#cleanupRecord(workerId);
+                try { this.#slots.freeSlots(workerId); } catch (_) { /* ignore */ }
+                logError(new ProjectError(`updateState STARTING failed: ${err?.message}`, { workerId }));
+                this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId: newSlotId, pluginId, reason: "STATE_TRANSITION_FAILURE", caller });
+                return "REJECTED";
+            }
+
+            // Spawn OS process
+            const spawnResult = this.#actions.create(workerId, pluginData, { flag: false }, { initTimeout: pluginData.initTimeout ?? this.config.spawnInitTimeout });
+            if (spawnResult instanceof ProjectError) {
+                // synchronous failure — force cleanup and emit failure event
+                logError(spawnResult);
+                this.#forceCleanup(workerId, "CREATE_SYNC_FAILURE");
+                this.#emit("WORKER_SPAWN_FAILED", { workerId, slotId: newSlotId, pluginId, message: spawnResult.message, caller });
+                return "REJECTED";
+            }
+
+            this.#emit("WORKER_SPAWN_INITIATED", { workerId, slotId: newSlotId, pluginId, caller });
+            this.#emitMetric("worker.spawn.initiated", 1, { pluginId });
+            return "ACCEPTED";
+        } catch (err) {
+            logError(new ProjectError(`bindWorkerToSlot failed: ${err?.message}`, { workerId }));
+            this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId, pluginId, reason: err?.message, caller });
+            return "REJECTED";
+        }
     }
 
     /**
-     * Mark a BUSY worker's task as complete. Returns worker to IDLE.
-     * Emits WORKER_IDLE so the Runtime Scheduler can immediately dispatch
-     * the next task without waiting for a polling cycle.
-     *
-     * @param {string} workerId
-     * @returns {true} — throws on invalid state or unknown worker
+     * drainWorker(workerId, gracefulMs)
+     * - returns "ACCEPTED" | "REJECTED"
      */
-    completeTask(workerId) {
-        this.#register.completeWork(workerId);
+    drainWorker(workerId, gracefulMs = this.config.killGraceMs, caller) {
         const worker = this.#register.getWorker(workerId);
-        this.#emit("WORKER_IDLE", { workerId, pluginId: worker?.pluginId });
-        return true;
-    }
+        if (!worker) return "REJECTED";
 
-    /**
-     * Promote a WARM worker to an active WORKER slot.
-     * Fails if no worker slot is free.
-     *
-     * @param {string} workerId
-     * @returns {true} — throws if not WARM or no slot available
-     */
-    promoteWarm(workerId) {
-        const worker = this.#register.getWorker(workerId);
-        if (!worker) {
-            throw new ProjectError(`Worker ${workerId} not found`, {
-                code: "WORKER_NOT_FOUND", workerId,
-            });
-        }
-        if (worker.state !== "WARM") {
-            throw new ProjectError(
-                `Worker ${workerId} must be WARM to promote (current: ${worker.state})`,
-                { code: "INVALID_STATE", workerId }
-            );
+        try {
+            if (worker.state !== "TERMINATING") {
+                this.#register.terminate(workerId);
+            }
+        } catch (err) {
+            // ignore transition errors
         }
 
-        const promoted = this.#slots.promote(workerId);
-        if (!promoted) {
-            throw new ProjectError(
-                `No free worker slot to promote ${workerId} into`,
-                { code: "NO_SLOT_AVAILABLE", workerId }
-            );
-        }
-
-        this.#register.promoteWarm(workerId);
-        this.#emit("WORKER_PROMOTED", { workerId, pluginId: worker.pluginId });
-        return true;
-    }
-
-    /**
-     * Gracefully terminate a worker.
-     * Sends SIGTERM, escalates to SIGKILL after gracefulMs.
-     * The CLOSED event from WorkerActions drives the final cleanup.
-     *
-     * @param {string} workerId
-     * @param {number} [gracefulMs=5000]
-     * @returns {true} — throws if worker not found
-     */
-
-    terminateWorker(workerId, gracefulMs = 5_000) {
-        const worker = this.#register.getWorker(workerId);
-        if (!worker) {
-            throw new ProjectError(`Worker ${workerId} not found`, {
-                code: "WORKER_NOT_FOUND", workerId,
-            });
-        }
-
-        // Signal intent — prevents new task assignment while waiting for exit
-        if (worker.state !== "TERMINATING") {
-            try { this.#register.terminate(workerId); } catch { /* ignore */ }
-        }
-
+        this.#emit("WORKER_DRAINING", { workerId, pluginId: worker.pluginId, caller });
         const killResult = this.#actions.kill(workerId, gracefulMs);
         if (killResult instanceof ProjectError) {
-            // Process already gone — CLOSED will not arrive, drive cleanup now
+            // process already gone — cleanup now
             this.#forceCleanup(workerId, "PROCESS_ALREADY_GONE");
         }
-
-        return true;
+        return "ACCEPTED";
     }
 
     /**
-     * Send a message to a worker's stdin IPC channel.
-     *
-     * @param {string} workerId
-     * @param {object} message
-     * @returns {Promise<true>} — throws on send failure
+     * evictWorker(workerId, reason)
      */
-    async send(workerId, message) {
-        const result = await this.#actions.send(workerId, message);
-        if (result instanceof ProjectError) throw result;
-        return true;
+    evictWorker(workerId, reason = "ADMIN_EVICT", caller) {
+        const worker = this.#register.getWorker(workerId);
+        if (!worker) return "REJECTED";
+
+        this.#emit("WORKER_EVICTED", { workerId, pluginId: worker.pluginId, reason, caller });
+        const killResult = this.#actions.kill(workerId, 0);
+        if (killResult instanceof ProjectError) {
+            // force cleanup
+            this.#forceCleanup(workerId, "EVICT_KILL_FAILED");
+        }
+        return "ACCEPTED";
+    }
+
+    /**
+     * queryPool() — synchronous snapshot
+     */
+    queryPool() {
+        return {
+            register: this.#register.getStateCounts(),
+            slots: this.#slots.slotStats(),
+            actions: this.#actions.getInternalStats(),
+            timestamp: Date.now(),
+        };
+    }
+
+    // ---------------- Resource & IPC wrappers ----------------
+
+    async getResourceSnapshot(workerIds = []) {
+        try {
+            const report = await this.#actions.resource(workerIds);
+            return report;
+        } catch (err) {
+            this.#emit("WORKER_RESOURCE_ERROR", { workerIds, err: err?.message ?? String(err) });
+            throw err;
+        }
+    }
+
+    /**
+     * send(workerId, message, opts = {})
+     *
+     * No-queue policy: attempts immediate send only. Fails fast if worker not in allowed state.
+     * Throws ProjectError on permanent failure.
+     *
+     * opts:
+     *   timeoutMs: number (ms) per attempt, default this.config.sendTimeoutMs
+     *   maxAttempts: number, default this.config.maxSendAttempts
+     *   retryDelayMs: number, short backoff between attempts, default this.config.sendRetryDelayMs
+     *   caller: string optional
+     */
+    async send(workerId, message, opts = {}) {
+        const timeoutMs = Number(opts.timeoutMs ?? this.config.sendTimeoutMs);
+        const maxAttempts = Number(opts.maxAttempts ?? this.config.maxSendAttempts);
+        const retryDelayMs = Number(opts.retryDelayMs ?? this.config.sendRetryDelayMs);
+        const caller = opts.caller;
+
+        if (!workerId) {
+            throw new ProjectError("send requires workerId", { code: "MISSING_ARG" });
+        }
+
+        // Validate worker exists
+        const worker = this.#register.getWorker(workerId);
+        if (!worker) {
+            const err = new ProjectError("Worker not found", { workerId, code: "WORKER_NOT_FOUND" });
+            this.#emit("WORKER_SEND_REJECTED_STATE", { workerId, reason: "NOT_FOUND", caller });
+            throw err;
+        }
+
+        // Allowed states for immediate send
+        const allowedStates = new Set(["IDLE", "BUSY", "STARTING"]);
+        if (!allowedStates.has(worker.state)) {
+            const err = new ProjectError(`Worker state ${worker.state} not allowed for send`, {
+                workerId, code: "INVALID_STATE"
+            });
+            this.#emit("WORKER_SEND_REJECTED_STATE", { workerId, state: worker.state, caller });
+            this.#emitMetric("worker.send.rejected_state", 1, { workerId, state: worker.state });
+            throw err;
+        }
+
+        // Helper: single attempt with timeout
+        const attemptOnce = () => {
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const sendPromise = this.#actions.send(workerId, message);
+
+                const t = setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    const pe = new ProjectError("send timeout", { workerId, code: "SEND_TIMEOUT" });
+                    reject(pe);
+                }, timeoutMs);
+
+                sendPromise.then((res) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(t);
+                    resolve(res);
+                }).catch((err) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(t);
+                    const pe = (err instanceof ProjectError) ? err : new ProjectError(String(err), { workerId, code: "SEND_FAIL", cause: err });
+                    reject(pe);
+                });
+            });
+        };
+
+        // Attempt loop (fail-fast but allow bounded retries)
+        let attempt = 0;
+        const startAll = Date.now();
+        while (attempt < maxAttempts) {
+            attempt += 1;
+            const attemptStart = Date.now();
+            try {
+                await attemptOnce();
+                const latency = Date.now() - attemptStart;
+                this.#emit("WORKER_SEND_SUCCESS", { workerId, attempt, latency, caller });
+                this.#emitMetric("worker.send.success", 1, { workerId, attempt });
+                return true;
+            } catch (err) {
+
+                this.#emit("WORKER_SEND_RETRY", { workerId, attempt, err: err.message, caller });
+                this.#emitMetric("worker.send.retry", 1, { workerId, attempt });
+
+                // If last attempt, escalate
+                if (attempt >= maxAttempts) {
+                    this.#emit("WORKER_SEND_FAILED", {
+                        workerId,
+                        attempts: attempt,
+                        totalLatencyMs: Date.now() - startAll,
+                        err: err.message,
+                        workerState: worker.state,
+                        caller
+                    });
+                    this.#emitMetric("worker.send.failure", 1, { workerId, attempts: attempt });
+
+                    // Optional escalation: if configured, force cleanup
+                    if (this.config.failOnSendError) {
+                        try {
+                            this.#forceCleanup(workerId, "SEND_FAILURE");
+                        } catch (_) { /* ignore */ }
+                    }
+
+                    throw err;
+                }
+
+                // short backoff before next attempt
+                await new Promise(r => setTimeout(r, retryDelayMs));
+                // re-check worker state before next attempt
+                const refreshed = this.#register.getWorker(workerId);
+                if (!refreshed || !allowedStates.has(refreshed.state)) {
+                    const stateErr = new ProjectError(`Worker state changed to ${refreshed?.state ?? "UNKNOWN"}`, {
+                        workerId, code: "STATE_CHANGED"
+                    });
+                    this.#emit("WORKER_SEND_ABORTED_STATE_CHANGE", { workerId, newState: refreshed?.state, attempt, caller });
+                    throw stateErr;
+                }
+                // continue loop
+            }
+        }
+
+        // Should not reach here
+        const err = new ProjectError("send failed unexpectedly", { workerId, code: "SEND_UNKNOWN" });
+        this.#emit("WORKER_SEND_FAILED", { workerId, err: err.message, caller });
+        throw err;
     }
 
     killAll() {
-        this.#actions.killAll();
+        try {
+            this.#actions.killAll();
+            this.#emit("WORKER_KILLALL_INITIATED", { timestamp: Date.now() });
+        } catch (err) {
+            this.#emit("WORKER_KILLALL_ERROR", { err: err?.message ?? String(err) });
+            throw err;
+        }
     }
 
     unmonitorAll() {
-        this.#actions.unmonitorAll();
+        try {
+            this.#actions.unmonitorAll();
+            this.#emit("WORKER_UNMONITOR_ALL", { timestamp: Date.now() });
+        } catch (err) {
+            this.#emit("WORKER_UNMONITOR_ERROR", { err: err?.message ?? String(err) });
+            throw err;
+        }
     }
 
-    // Read APIs
-    getWorker(workerId) {
-        return this.#register.getWorker(workerId);
-    }
-
-    getStateCounts() {
-        return this.#register.getStateCounts();
-    }
-
-    getSlotStats() {
-        return this.#slots.slotStats();
-    }
-
-    hasFreeWorkerSlot() {
-        return this.#slots.freeWorkerSlot > 0;
-    }
-
-    hasFreeWarmSlot() {
-        return this.#slots.freeWarmSlot > 0;
-    }
-
-    async getResourceSnapshot(workerIds) {
-        const result = await this.#actions.resource(workerIds);
-        if (result instanceof ProjectError) throw result;
-        return result;
-    }
-
-    getStalledWorkers(timeoutMs) {
-        return this.#register.getStalledWorkers(timeoutMs);
-    }
-
-    // ----------------- WorkerActions event router -----------------
+    // ---------------- WorkerActions event router ----------------
 
     #handle(event) {
         const { type, workerId } = event;
 
-        // SPAWNED arrives before we have confirmed STARTING in some race windows.
-        const worker = this.#register.getWorker(workerId);
-        if (!worker && type !== "SPAWNED") {
-            // Stale event for an already-purged worker — safe to discard
-            return;
-        }
-
+        // SPAWNED may arrive before register entry exists in some races; handle carefully
         switch (type) {
-            case "SPAWNED":        this.#onSpawned(workerId, event);       break;
-            case "SPAWN_TIMEOUT":  this.#onSpawnTimeout(workerId, event);  break;
-            case "RUNTIME_UPDATE": this.#onRuntimeUpdate(workerId, event); break;
-            case "RUNTIME_ERROR":  this.#onRuntimeError(workerId, event);  break;
-            case "OS_ERROR":       this.#onOsError(workerId, event);       break;
-            case "ERROR":          this.#onError(workerId, event);         break;
-            case "CLOSED":         this.#onClosed(workerId, event);        break;
-            case "RAW_LOG":        this.#onRawLog(workerId, event);        break;
-            case "STDERR_LOG":     this.#onStderrLog(workerId, event);     break;
+            case "SPAWNED":
+                this.#onSpawned(workerId, event);
+                break;
+            case "SPAWN_TIMEOUT":
+                this.#onSpawnTimeout(workerId, event);
+                break;
+            case "RUNTIME_UPDATE":
+                this.#onRuntimeUpdate(workerId, event);
+                break;
+            case "RUNTIME_ERROR":
+                this.#onRuntimeError(workerId, event);
+                break;
+            case "OS_ERROR":
+                this.#onOsError(workerId, event);
+                break;
+            case "ERROR":
+                this.#onError(workerId, event);
+                break;
+            case "CLOSED":
+                this.#onClosed(workerId, event);
+                break;
+            case "RAW_LOG":
+                this.#onRawLog(workerId, event);
+                break;
+            case "STDERR_LOG":
+                this.#onStderrLog(workerId, event);
+                break;
             default:
                 this.#emit("UNKNOWN_EVENT", { workerId, originalType: type });
-                break;
         }
     }
 
-    // Event handlers
-
-    /**
-     * OS confirmed the process started.
-     * STARTING → IDLE (worker) or STARTING → WARM (pre-warm slot).
-     */
     #onSpawned(workerId, event) {
         const worker = this.#register.getWorker(workerId);
 
         if (!worker) {
-            // Race: cleanup ran before SPAWNED arrived. Kill the orphan process.
+            // Orchestrator didn't have a record yet — kill orphan process to be safe
             this.#actions.kill(workerId, 0);
             return;
         }
 
         if (worker.state !== "STARTING") {
-            this.#emit("SPAWN_RACE_DISCARDED", {
-                workerId, currentState: worker.state,
-            });
+            this.#emit("SPAWN_RACE_DISCARDED", { workerId, currentState: worker.state });
             return;
         }
 
         try {
-            // Determine warm vs active by SlotManager metadata if available
-            const slotMeta = (typeof this.#slots.getWorker === 'function') ? this.#slots.getWorker(workerId) : null;
-            const isWarm   = slotMeta?.state === "WARM";
+            // Determine whether slot was warm by checking SlotManager metadata if available
+            const slotMeta = (typeof this.#slots.getWorker === "function") ? this.#slots.getWorker(workerId) : null;
+            const isWarm = slotMeta?.state === "WARM";
 
+            this.#register.markReady(workerId); // STARTING -> IDLE
             if (isWarm) {
-                this.#register.markReady(workerId);  // STARTING → IDLE
-                this.#register.markWarm(workerId);   // IDLE → WARM
-                this.#emit("WORKER_WARM_READY", {
-                    workerId, pluginId: worker.pluginId, pid: event.pid,
-                });
+                this.#register.markWarm(workerId); // IDLE -> WARM
+                this.#emit("WORKER_WARM_READY", { workerId, pluginId: worker.pluginId, pid: event.pid });
             } else {
-                this.#register.markReady(workerId);  // STARTING → IDLE
-                this.#emit("WORKER_READY", {
-                    workerId, pluginId: worker.pluginId, pid: event.pid,
-                });
+                this.#emit("WORKER_READY", { workerId, pluginId: worker.pluginId, pid: event.pid });
             }
+            this.#emitMetric("worker.spawned", 1, { pluginId: worker.pluginId });
         } catch (err) {
-            logError(new ProjectError(`markReady failed: ${err.message}`, {
-                code: "STATE_TRANSITION_FAILURE", workerId,
-            }));
-            this.#emit("WORKER_SPAWN_STATE_ERROR", {
-                workerId, err: err.message,
-            });
+            logError(new ProjectError(`markReady failed: ${err?.message}`, { workerId }));
+            this.#emit("WORKER_SPAWN_STATE_ERROR", { workerId, err: err?.message });
             this.#forceCleanup(workerId, "SPAWN_STATE_ERROR");
         }
     }
 
     #onSpawnTimeout(workerId, event) {
         const worker = this.#register.getWorker(workerId);
-
-        this.#emit("WORKER_SPAWN_TIMEOUT", {
-            workerId,
-            pluginId: worker?.pluginId,
-            message:  event.message,
-        });
+        this.#emit("WORKER_SPAWN_TIMEOUT", { workerId, pluginId: worker?.pluginId, message: event.message });
+        this.#emitMetric("worker.spawn.timeout", 1, { pluginId: worker?.pluginId });
 
         this.#forceCleanup(workerId, "SPAWN_TIMEOUT");
     }
 
     #onRuntimeUpdate(workerId, event) {
-        this.#emit("WORKER_UPDATE", {
-            workerId,
-            pluginId: this.#register.getWorker(workerId)?.pluginId,
-            data:     event.data,
-        });
+        this.#emit("WORKER_UPDATE", { workerId, pluginId: this.#register.getWorker(workerId)?.pluginId, data: event.data });
     }
 
-    /**
-     * Valid JSON received on stderr — plugin reported a structured error.
-     * Move to TERMINATING and send SIGTERM.
-     * CLOSED event will complete cleanup.
-     * Runtime Scheduler decides retry/escalation on WORKER_RUNTIME_ERROR.
-     */
     #onRuntimeError(workerId, event) {
         const worker = this.#register.getWorker(workerId);
         if (!worker) return;
-
-        logError(new ProjectError(`Plugin runtime error in ${workerId}`, {
-            code: "RUNTIME_ERROR", workerId,
-        }));
-
-        this.#emit("WORKER_RUNTIME_ERROR", {
-            workerId,
-            pluginId: worker.pluginId,
-            err:      event.err,
-        });
-
+        logError(new ProjectError(`Plugin runtime error in ${workerId}`, { workerId }));
+        this.#emit("WORKER_RUNTIME_ERROR", { workerId, pluginId: worker.pluginId, err: event.err });
         if (worker.state !== "TERMINATING") {
-            try { this.#register.terminate(workerId); } catch { /* ignore */ }
+            try { this.#register.terminate(workerId); } catch (_) { /* ignore */ }
         }
-
-        const killResult = this.#actions.kill(workerId, 5_000);
+        const killResult = this.#actions.kill(workerId, 5000);
         if (killResult instanceof ProjectError) {
             this.#forceCleanup(workerId, "RUNTIME_ERROR_PROCESS_GONE");
         }
@@ -495,30 +606,19 @@ class ProcessPoolOrchestrator {
     #onError(workerId, event) {
         const worker = this.#register.getWorker(workerId);
         if (!worker) return;
-
         if (event.err) logError(event.err);
-
         this.#emit("WORKER_COMM_ERROR", { workerId, err: event.err });
-
         if (worker.state !== "TERMINATING") {
-            try { this.#register.terminate(workerId); } catch { /* ignore */ }
+            try { this.#register.terminate(workerId); } catch (_) { /* ignore */ }
         }
     }
 
-    /**
-     * Process exited — final lifecycle event.
-     * Full cleanup regardless of how we arrived here.
-     */
     #onClosed(workerId, event) {
         const { code, signal } = event;
         const worker = this.#register.getWorker(workerId);
-
         const isClean = code === 0 && signal === null;
-
         if (isClean) {
-            this.#emit("WORKER_CLOSED_CLEAN", {
-                workerId, pluginId: worker?.pluginId,
-            });
+            this.#emit("WORKER_CLOSED_CLEAN", { workerId, pluginId: worker?.pluginId });
         } else {
             this.#emit("WORKER_CRASHED", {
                 workerId,
@@ -528,59 +628,65 @@ class ProcessPoolOrchestrator {
                 reason: signal ? `Killed by ${signal}` : `Exit code ${code}`,
             });
         }
-
         this.#forceCleanup(workerId, isClean ? "CLEAN_EXIT" : "CRASH");
     }
 
-    /** Unstructured stdout — informational plugin log. */
     #onRawLog(workerId, event) {
         this.#emit("WORKER_LOG", { workerId, level: "info", data: event.data });
     }
 
-    /** Unstructured stderr — plugin warning, not necessarily fatal. */
     #onStderrLog(workerId, event) {
         this.#emit("WORKER_LOG", { workerId, level: "warn", data: event.data });
     }
 
-    // ----------------- Cleanup pipeline -----------------
+    // ---------------- Claim helpers ----------------
 
-    #forceCleanup(workerId, reason) {
-        const worker = this.#register.getWorker(workerId);
-
-        // Prefer freeing by workerId (idempotent). If that fails, try freeing by discovered slotId.
+    _generateTempKey(pluginId) {
+        // Prefer crypto.randomUUID if available
         try {
-            this.#slots.freeSlots(workerId);
-        } catch (err) {
-            try {
-                const slotId = (typeof this.#slots.getSlotIdForWorker === 'function')
-                    ? this.#slots.getSlotIdForWorker(workerId)
-                    : null;
-                if (slotId !== null && typeof this.#slots.freeSlotById === 'function') {
-                    this.#slots.freeSlotById(slotId);
-                }
-            } catch (_) { /* ignore */ }
-        }
+            if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+                return `temp:${pluginId}:${crypto.randomUUID()}`;
+            }
+        } catch (_) { /* ignore */ }
 
-        this.#cleanupRecord(workerId);
-
-        this.#emit("WORKER_DEAD", {
-            workerId,
-            pluginId: worker?.pluginId,
-            reason,
-        });
+        return `temp:${pluginId}:${Date.now()}:${Math.floor(Math.random() * 10000)}`;
     }
 
-    /**
-     * Navigate the Register state machine to DEAD from any current state.
-     * Routes through TERMINATING when required by the transition table.
-     */
+    _claimWarmSlotWithTimeout(pluginId) {
+        const tempKey = this._generateTempKey(pluginId);
+        const slotId = this.#slots.add(tempKey, pluginId, true);
+        if (slotId === null || slotId === undefined) return null;
+
+        const timer = setTimeout(() => {
+            // If still unbound, free it
+            const claim = this.#_tempClaims.get(tempKey);
+            if (claim) {
+                try { this.#slots.freeSlots(tempKey); } catch (_) { /* ignore */ }
+                this.#_tempClaims.delete(tempKey);
+                this.#emit("WORKER_SLOT_CLAIM_EXPIRED", { slotId: claim.slotId, pluginId: claim.pluginId, tempKey });
+                this.#emitMetric("worker.slot.claim.expired", 1, { pluginId });
+            }
+        }, this.config.claimTTLMs);
+
+        this.#_tempClaims.set(tempKey, { slotId, timer, pluginId });
+        return { slotId, tempKey };
+    }
+
+    _cancelClaim(tempKey) {
+        const claim = this.#_tempClaims.get(tempKey);
+        if (!claim) return false;
+        try { clearTimeout(claim.timer); } catch (_) { /* ignore */ }
+        this.#_tempClaims.delete(tempKey);
+        return true;
+    }
+
+    // ---------------- Cleanup ----------------
+
     #cleanupRecord(workerId) {
         const worker = this.#register.getWorker(workerId);
         if (!worker) return;
-
         try {
             const { state } = worker;
-
             if (state === "CREATED" || state === "STARTING" || state === "TERMINATING") {
                 this.#register.markDead(workerId);
             } else if (state === "DEAD") {
@@ -590,38 +696,48 @@ class ProcessPoolOrchestrator {
                 this.#register.markDead(workerId);
             }
         } catch (err) {
-            // Never crash the orchestrator during cleanup — log and continue
-            console.error(
-                `[ProcessPoolOrchestrator] cleanupRecord failed for ${workerId}: ${err.message}`
-            );
+            console.error(`[ProcessPoolOrchestrator] cleanupRecord failed for ${workerId}: ${err?.message}`);
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // INTERNAL — event emission
-    // ─────────────────────────────────────────────────────────────────────────
+    #forceCleanup(workerId, reason = "UNKNOWN") {
+        const worker = this.#register.getWorker(workerId);
 
-    /**
-     * Forward an event to the Runtime Scheduler.
-     * Wrapped in try/catch — an upstream callback failure must never
-     * crash the orchestrator or corrupt component state.
-     */
-    #emit(type, payload = {}) {
+        // Prefer freeing by workerId; fallback to slotId if available
         try {
-            this.#onEvent({ type, timestamp: Date.now(), ...payload });
+            this.#slots.freeSlots(workerId);
         } catch (err) {
-            console.error(
-                `[ProcessPoolOrchestrator] onEvent threw for ${type}: ${err.message}`
-            );
+            try {
+                const slotId = (typeof this.#slots.getSlotIdForWorker === "function") ? this.#slots.getSlotIdForWorker(workerId) : null;
+                if (slotId !== null && typeof this.#slots.freeSlotById === "function") {
+                    this.#slots.freeSlotById(slotId);
+                }
+            } catch (_) { /* ignore */ }
         }
+
+        this.#cleanupRecord(workerId);
+
+        this.#emit("WORKER_DEAD", { workerId, pluginId: worker?.pluginId, reason });
+        this.#emitMetric("worker.dead", 1, { pluginId: worker?.pluginId, reason });
+    }
+
+    // ---------------- Convenience Register wrappers ----------------
+
+    assignTask(workerId, taskData = {}) {
+        this.#register.assignWork(workerId, taskData);
+        return true;
+    }
+
+    completeTask(workerId) {
+        this.#register.completeWork(workerId);
+        const worker = this.#register.getWorker(workerId);
+        this.#emit("WORKER_IDLE", { workerId, pluginId: worker?.pluginId });
+        return true;
+    }
+
+    promoteWarm(workerId) {
+        return this.#slots.promote(workerId);
     }
 }
 
 export default ProcessPoolOrchestrator;
-
-
-/* 
-refinements still needs to be done 
-
-
-*/
