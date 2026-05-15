@@ -1,17 +1,17 @@
+// slotManager.mjs
 import os from "node:os";
 
 class SlotManager {
-
     // ===== SLOT STORAGE =====
-    #workerSlots; // Map<slotId, { workerId, pluginId }>
-    #warmSlots;   // Map<slotId, { workerId, pluginId }>
+    #workerSlots; // Map<slotId, { workerId, pluginId, meta }>
+    #warmSlots;   // Map<slotId, { workerId, pluginId, meta }>
 
     // ===== FREE SLOT TRACKING =====
     #workerFreeSet; // Set of free worker slot IDs
     #warmFreeSet;   // Set of free warm slot IDs
 
     // ===== REVERSE INDEX (CRITICAL) =====
-    #workerIndex; // Map<workerId, { type: "worker" | "warm", slotId }>
+    #workerIndex; // Map<workerIdOrTempKey, { type: "worker" | "warm", slotId }>
 
     // ===== WORKER METADATA =====
     #workers; // Map<workerId, { pluginId, state, startedAt, lastUsedAt }>
@@ -21,41 +21,29 @@ class SlotManager {
     #warmSlotCount;
 
     constructor(config = {}) {
+        this.#workerSlotCount = Number(config.workerSlot ?? Math.max(1, os.cpus().length - 1));
+        this.#warmSlotCount = Number(config.warmSlot ?? Math.floor(this.#workerSlotCount / 2));
 
-        // Determine worker slot count safely
-        this.#workerSlotCount = config.workerSlot ?? Math.max(1, os.cpus().length - 1);
-
-        // Determine warm slot count safely
-        this.#warmSlotCount = config.warmSlot ?? Math.floor(this.#workerSlotCount / 2);
-
-        // Initialize slot maps
         this.#workerSlots = new Map();
         this.#warmSlots = new Map();
 
-        // Initialize free slot sets
         this.#workerFreeSet = new Set();
         this.#warmFreeSet = new Set();
 
-        // Initialize reverse index
         this.#workerIndex = new Map();
-
-        // Initialize worker metadata store
         this.#workers = new Map();
 
-        // Public counters
         this.freeWorkerSlot = this.#workerSlotCount;
         this.usedWorkerSlot = 0;
 
         this.freeWarmSlot = this.#warmSlotCount;
         this.usedWarmSlot = 0;
 
-        // Populate worker slots
         for (let i = 0; i < this.#workerSlotCount; i++) {
             this.#workerSlots.set(i, null);
             this.#workerFreeSet.add(i);
         }
 
-        // Populate warm slots
         for (let i = 0; i < this.#warmSlotCount; i++) {
             this.#warmSlots.set(i, null);
             this.#warmFreeSet.add(i);
@@ -72,15 +60,16 @@ class SlotManager {
         }
     }
 
-    // ===== ADD WORKER =====
+    /**
+     * add(workerId, pluginId, isWarm = false)
+     * - occupant key may be a tempKey or a real workerId
+     * - returns numeric slotId on success or null on failure
+     */
     add(workerId, pluginId, isWarm = false) {
-
         if (!workerId || !pluginId) return null;
         if (this.#workerIndex.has(workerId)) return null;
 
-        const now = Date.now(); // Current timestamp
-
-        // Register worker metadata
+        const now = Date.now();
         this.#workers.set(workerId, {
             pluginId,
             state: isWarm ? "WARM" : "RUNNING",
@@ -88,83 +77,65 @@ class SlotManager {
             lastUsedAt: now
         });
 
-        // ===== WARM SLOT =====
         if (isWarm) {
-
             if (this.#warmFreeSet.size === 0) {
                 this.#workers.delete(workerId);
                 return null;
             }
-
             const slotId = this.#warmFreeSet.values().next().value;
-
-            this.#warmSlots.set(slotId, { workerId, pluginId });
-
-            // Update tracking
+            this.#warmSlots.set(slotId, { workerId, pluginId, meta: { state: "WARM" } });
             this.#warmFreeSet.delete(slotId);
             this.#workerIndex.set(workerId, { type: "warm", slotId });
-
             this.freeWarmSlot--;
             this.usedWarmSlot++;
-
             this.#assertInvariants();
-
             return slotId;
         }
 
-        // ===== WORKER SLOT =====
         if (this.#workerFreeSet.size === 0) {
             this.#workers.delete(workerId);
             return null;
         }
-
         const slotId = this.#workerFreeSet.values().next().value;
-        this.#workerSlots.set(slotId, { workerId, pluginId });
+        this.#workerSlots.set(slotId, { workerId, pluginId, meta: { state: "RUNNING" } });
         this.#workerFreeSet.delete(slotId);
         this.#workerIndex.set(workerId, { type: "worker", slotId });
-
         this.freeWorkerSlot--;
         this.usedWorkerSlot++;
-
         this.#assertInvariants();
-
         return slotId;
     }
 
-    // ===== FREE WORKER =====
-    freeSlots(workerId) {
-
-        const record = this.#workerIndex.get(workerId);
+    /**
+     * freeSlots(occupantKey)
+     * - frees slot by occupant key (workerId or tempKey)
+     */
+    freeSlots(occupantKey) {
+        const record = this.#workerIndex.get(occupantKey);
         if (!record) return false;
-
         const { type, slotId } = record;
 
-        // Remove from slot
         if (type === "worker") {
             this.#workerSlots.set(slotId, null);
             this.#workerFreeSet.add(slotId);
-
             this.freeWorkerSlot++;
             this.usedWorkerSlot--;
         } else {
             this.#warmSlots.set(slotId, null);
             this.#warmFreeSet.add(slotId);
-
             this.freeWarmSlot++;
             this.usedWarmSlot--;
         }
 
-        // Remove from index + metadata
-        this.#workerIndex.delete(workerId);
-        this.#workers.delete(workerId);
-
+        this.#workerIndex.delete(occupantKey);
+        this.#workers.delete(occupantKey);
         this.#assertInvariants();
-
         return true;
     }
 
     /**
-     * Free a slot by numeric slotId. Convenience wrapper.
+     * freeSlotById(slotId)
+     * - convenience wrapper to free by numeric id
      */
     freeSlotById(slotId) {
         if (this.#workerSlots.has(slotId)) {
@@ -179,70 +150,113 @@ class SlotManager {
         }
         return false;
     }
-    // ===== PROMOTE WARM → WORKER =====
-    promote(workerId) {
 
+    /**
+     * promote(workerId)
+     * - move a warm occupant into a worker slot (if available)
+     */
+    promote(workerId) {
         const record = this.#workerIndex.get(workerId);
         if (!record || record.type !== "warm") return false;
-
-        // Check if worker slot available
         if (this.#workerFreeSet.size === 0) return false;
 
         const warmSlotId = record.slotId;
-
         const slotData = this.#warmSlots.get(warmSlotId);
         if (!slotData) return false;
         const pluginId = slotData.pluginId;
 
-        // Remove from warm slot
         this.#warmSlots.set(warmSlotId, null);
         this.#warmFreeSet.add(warmSlotId);
-
         this.freeWarmSlot++;
         this.usedWarmSlot--;
 
-        // Assign to worker slot
         const workerSlotId = this.#workerFreeSet.values().next().value;
-
-        this.#workerSlots.set(workerSlotId, { workerId, pluginId });
+        this.#workerSlots.set(workerSlotId, { workerId, pluginId, meta: { state: "RUNNING" } });
         this.#workerFreeSet.delete(workerSlotId);
-
         this.freeWorkerSlot--;
         this.usedWorkerSlot++;
 
-        // Update index
-        this.#workerIndex.set(workerId, {
-            type: "worker",
-            slotId: workerSlotId
-        });
+        this.#workerIndex.set(workerId, { type: "worker", slotId: workerSlotId });
 
-        // Update metadata
         const meta = this.#workers.get(workerId);
-        meta.state = "RUNNING";
-        meta.lastUsedAt = Date.now();
+        if (meta) {
+            meta.state = "RUNNING";
+            meta.lastUsedAt = Date.now();
+        }
 
         this.#assertInvariants();
-
         return true;
     }
 
-    // ===== GET WORKER INFO =====
+    /**
+     * getWorker(workerId)
+     * - returns worker metadata (pluginId, state, startedAt, lastUsedAt) or null
+     */
     getWorker(workerId) {
         return this.#workers.get(workerId) || null;
     }
 
     /**
-   * Return the numeric slotId for a given workerId (or tempKey).
-   * If the workerId is not present in the index, returns null.
-   */
+     * getSlotIdForWorker(workerId)
+     * - returns numeric slotId or null
+     */
     getSlotIdForWorker(workerId) {
         if (!workerId) return null;
         const rec = this.#workerIndex.get(workerId);
         return rec ? rec.slotId : null;
     }
 
+    /**
+     * replaceOccupant(slotId, expectedKey, newWorkerId)
+     * - Atomically replace occupant if expectedKey matches current occupant.
+     * - Returns true on success, false on mismatch/invalid slot.
+     */
+    replaceOccupant(slotId, expectedKey, newWorkerId) {
+        if (slotId === null || slotId === undefined) return false;
 
-    // ===== STATS =====
+        if (this.#workerSlots.has(slotId)) {
+            const slot = this.#workerSlots.get(slotId);
+            const current = slot?.workerId ?? slot?.workerId ?? null;
+            if (current !== expectedKey) return false;
+
+            if (this.#workerIndex.has(expectedKey)) this.#workerIndex.delete(expectedKey);
+
+            slot.workerId = newWorkerId;
+            slot.workerId = newWorkerId;
+            slot.meta = slot.meta ?? {};
+            this.#workerIndex.set(newWorkerId, { type: "worker", slotId });
+
+            const meta = this.#workers.get(newWorkerId) ?? { pluginId: slot.pluginId, state: "RUNNING", startedAt: Date.now(), lastUsedAt: Date.now() };
+            meta.pluginId = slot.pluginId;
+            meta.state = "RUNNING";
+            this.#workers.set(newWorkerId, meta);
+            return true;
+        }
+
+        if (this.#warmSlots.has(slotId)) {
+            const slot = this.#warmSlots.get(slotId);
+            const current = slot?.workerId ?? slot?.workerId ?? null;
+            if (current !== expectedKey) return false;
+
+            if (this.#workerIndex.has(expectedKey)) this.#workerIndex.delete(expectedKey);
+
+            slot.workerId = newWorkerId;
+            slot.meta = slot.meta ?? {};
+            this.#workerIndex.set(newWorkerId, { type: "warm", slotId });
+            const meta = this.#workers.get(newWorkerId) ?? { pluginId: slot.pluginId, state: "WARM", startedAt: Date.now(), lastUsedAt: Date.now() };
+            meta.pluginId = slot.pluginId;
+            meta.state = "WARM";
+            this.#workers.set(newWorkerId, meta);
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * slotStats()
+     * - returns summary of worker and warm slots
+     */
     slotStats() {
         return {
             worker: {
@@ -258,7 +272,10 @@ class SlotManager {
         };
     }
 
-    // ===== DEBUG =====
+    /**
+     * debug()
+     * - returns internal structures for debugging
+     */
     debug() {
         return {
             workerSlots: [...this.#workerSlots.entries()],
