@@ -50,6 +50,7 @@ describe("Register", () => {
         r.createWorkerRecord({ workerId: "s1", pluginId: "p", slotId: 40 });
         r.updateState("s1", "STARTING");
         r.markReady("s1");
+        // simulate assignedAt far in the past
         r.assignWork("s1", { taskId: "t", assignedAt: Date.now() - 100000 });
         const stalled = r.getStalledWorkers(1000);
         assert.ok(Array.isArray(stalled));

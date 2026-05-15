@@ -1,51 +1,50 @@
+import WorkerActions from "../workerActions.mjs";
 import { strict as assert } from "node:assert";
-import WorkerActionsModule from "../workerActions.mjs";
-import { EventEmitter } from "node:events";
-import { spawn } from "node:child_process";
+import { jest } from "@jest/globals";
 
-// We'll test WorkerActions by mocking spawn to return a controllable fake child process.
-// Jest provides mocking; here we monkeypatch spawn in the module scope.
+// Ensure spawn and pidusage mocks are used by Node resolution
+jest.unstable_mockModule("node:child_process", async () => await import("../__mocks__/child_process.mjs"));
+jest.unstable_mockModule("pidusage", async () => await import("../__mocks__/pidusage.mjs"));
+
+const { default: WAClass } = await import("../workerActions.mjs");
 
 describe("WorkerActions (unit)", () => {
-    let WorkerActions;
-    let originalSpawn;
-
-    beforeAll(() => {
-        // import the module class
-        WorkerActions = WorkerActionsModule;
-        originalSpawn = spawn;
+    test("create spawns fake child and emits SPAWNED", (done) => {
+        const wa = new WAClass(process.cwd());
+        const res = wa.create("w1", { pluginId: "p", cmd: "echo", args: [] }, {}, { initTimeout: 500 });
+        // create returns true
+        assert.equal(res, true);
+        // wait a tick for spawn event to be emitted by fake child
+        wa.on("update", (ev) => {
+            if (ev.type === "SPAWNED" && ev.workerId === "w1") done();
+        });
     });
 
-    afterAll(() => {
-        // restore if needed
+    test("send to existing worker resolves", async () => {
+        const wa = new WAClass(process.cwd());
+        wa.create("w2", { pluginId: "p", cmd: "echo", args: [] }, {}, { initTimeout: 500 });
+        // wait for spawn event then send
+        await new Promise((resolve) => setImmediate(resolve));
+        const ok = await wa.send("w2", { hello: "world" });
+        assert.equal(ok, true);
     });
 
-    test("create returns ProjectError when spawn fails to provide pid", () => {
-        // Create a fake spawn that returns an object without pid
-        const fakeChild = new EventEmitter();
-        fakeChild.stdin = { writable: false, write: () => false, once: () => {}, removeAllListeners: () => {} };
-        fakeChild.stdout = new EventEmitter();
-        fakeChild.stderr = new EventEmitter();
-        // monkeypatch spawn
-        const mod = await import("../workerActions.mjs");
-        // We cannot rebind node:child_process.spawn easily here without jest; instead test behavior by calling create with invalid cmd to cause spawn to throw
-        const wa = new WorkerActions(process.cwd());
-        // call create with invalid command to cause spawn error; create returns ProjectError on failure
-        const result = wa.create("x1", { pluginId: "p", cmd: "nonexistent-cmd-__unlikely__" }, {}, { initTimeout: 100 });
-        // result may be ProjectError or true depending on environment; assert that create returns either true or an error object
-        assert.ok(result === true || result instanceof Error);
-    });
-
-    test("send to non-existent worker returns ProjectError", async () => {
-        const wa = new WorkerActions(process.cwd());
+    test("send to missing worker returns ProjectError", async () => {
+        const wa = new WAClass(process.cwd());
         await assert.rejects(async () => {
-            await wa.send("nope", { hello: "world" });
+            await wa.send("missing", { x: 1 });
         }, /Worker ID not found|NOT_FOUND/);
     });
 
-    test("kill on missing worker returns ProjectError", () => {
-        const wa = new WorkerActions(process.cwd());
-        const res = wa.kill("nope", 10);
-        assert.ok(res instanceof Error || res instanceof Object);
+    test("kill triggers CLOSED and cleanup", (done) => {
+        const wa = new WAClass(process.cwd());
+        wa.create("w3", { pluginId: "p", cmd: "echo", args: [] }, {}, { initTimeout: 500 });
+        wa.on("update", (ev) => {
+            if (ev.type === "SPAWNED" && ev.workerId === "w3") {
+                const res = wa.kill("w3", 10);
+                assert.equal(res, true);
+            }
+            if (ev.type === "CLOSED" && ev.workerId === "w3") done();
+        });
     });
 });

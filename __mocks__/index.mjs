@@ -1,5 +1,8 @@
-// __mocks__/index.mjs
+// Mock index used by orchestrator integration tests to inject a controllable WorkerActions
 import { EventEmitter } from "node:events";
+import SlotManager from "../slotManager.mjs";
+import MemoryController from "../memoryController.mjs";
+import Register from "../workerRegister.mjs";
 
 class MockWorkerActions extends EventEmitter {
     constructor() {
@@ -10,9 +13,8 @@ class MockWorkerActions extends EventEmitter {
     }
 
     create(workerId, pluginData, _opts = {}, _config = {}) {
-        // Simulate synchronous success
         this.created.set(workerId, { pluginData });
-        // Do not emit SPAWNED here; tests will emit events manually to simulate timing
+        // do not auto-emit SPAWNED; tests will emit events to simulate timing
         return true;
     }
 
@@ -20,7 +22,6 @@ class MockWorkerActions extends EventEmitter {
         if (!this.created.has(workerId)) {
             throw new Error("NOT_FOUND");
         }
-        // record message
         const arr = this.sent.get(workerId) ?? [];
         arr.push(message);
         this.sent.set(workerId, arr);
@@ -32,20 +33,15 @@ class MockWorkerActions extends EventEmitter {
             return new Error("NOT_FOUND");
         }
         this.killed.add(workerId);
-        // emit CLOSED event to simulate process exit
         setImmediate(() => this.emit("update", { type: "CLOSED", workerId, code: 0, signal: null }));
         return true;
     }
 
     killAll() {
-        for (const id of this.created.keys()) {
-            this.kill(id, 0);
-        }
+        for (const id of this.created.keys()) this.kill(id, 0);
     }
 
-    unmonitorAll() {
-        // noop
-    }
+    unmonitorAll() { /* noop */ }
 
     getInternalStats() {
         return { created: Array.from(this.created.keys()) };
@@ -73,13 +69,14 @@ class ProjectError extends Error {
 }
 
 function logError(err) {
-    // no-op for tests
-    // console.error("MOCK LOG:", err.message);
+    // no-op in tests
 }
 
 export {
     MockWorkerActions as WorkerActions,
     ProjectError,
     logError,
-    // Export real SlotManager/Register/MemoryController from real files in tests by importing them directly
+    SlotManager,
+    MemoryController,
+    Register
 };
