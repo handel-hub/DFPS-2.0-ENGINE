@@ -198,6 +198,7 @@ class MemoryProfileStore {
                 existing.samples = 0;
                 existing.confidence = 0.0;
                 existing.recentRatios = [];
+                existing.rejectedSamples = 0;
                 existing.contractVersion = newVersion;
                 existing.source = 'contract-reset';
                 return true;
@@ -214,6 +215,7 @@ class MemoryProfileStore {
             emaRatio:          Number(rm.maxExpansionRatio ?? 8.0),
             recentRatios:      [],                    // circular buffer for 3σ
             samples:           0,
+            rejectedSamples:   0,
             confidence:        0.0,
             lastSeen:          Math.floor(Date.now() / 1000),
             contractVersion:   newVersion,
@@ -238,8 +240,9 @@ class MemoryProfileStore {
         // Hardened outlier detection
         if (this.#isOutlier(profile, newRatio)) {
             console.warn(`[MemoryProfileStore] Outlier rejected for ${key}: ratio=${newRatio.toFixed(2)}`);
-            profile.samples += 1;           // still count the attempt
-            profile.lastSeen = Math.floor(Date.now() / 1000);
+            profile.rejectedSamples = (profile.rejectedSamples || 0) + 1;
+            profile.lastAttempt = Math.floor(Date.now() / 1000);
+            // do not increment profile.samples or change confidence
             return false;
         }
 
@@ -262,9 +265,9 @@ class MemoryProfileStore {
         }
 
         // Conservative maxObservedRatio update
-        if (newRatio > profile.maxObservedRatio * this.#ratioNoiseThreshold) {
+        if (newRatio > (profile.maxObservedRatio || 0) * this.#ratioNoiseThreshold) {
             profile.maxObservedRatio = 
-                profile.maxObservedRatio * (1 - this.#maxAlpha) + newRatio * this.#maxAlpha;
+                (profile.maxObservedRatio || newRatio) * (1 - this.#maxAlpha) + newRatio * this.#maxAlpha;
         }
 
         // Maintain rolling window for 3σ (simple circular buffer)
@@ -278,6 +281,13 @@ class MemoryProfileStore {
         profile.samples += 1;
         profile.confidence = Math.min(1.0, profile.samples / this.#confidenceMaturitySamples);
         profile.lastSeen = Math.floor(Date.now() / 1000);
+
+        // bump access order: reinsert into Map to implement lightweight LRU
+        if (this.#store.has(key)) {
+            const val = this.#store.get(key);
+            this.#store.delete(key);
+            this.#store.set(key, val);
+        }
 
         return true;
     }
@@ -323,13 +333,25 @@ class MemoryProfileStore {
             requiredMB = Math.max(requiredMB, profile.baseOverheadMB * 1.25);
         }
 
+        // bump access order on read
+        if (this.#store.has(key)) {
+            const val = this.#store.get(key);
+            this.#store.delete(key);
+            this.#store.set(key, val);
+        }
+
         return Math.ceil(requiredMB);
     }
 
     get(pluginId, extension, contextFactors = {}) {
         const key = this.#makeKeyStrict({ pluginId, extension, ...contextFactors });
         const p = this.#store.get(key);
-        return p ? { ...p } : null;
+        if (!p) return null;
+        // bump access order on read
+        const copy = { ...p };
+        this.#store.delete(key);
+        this.#store.set(key, p);
+        return copy;
     }
 }
 

@@ -201,9 +201,13 @@ class CpuProfileManager {
             profile.peakCpu = cpuNorm;
             profile.variance = 0;
         } else {
-            profile.avgCpu = this.#config.emaAlpha * cpuNorm + (1 - this.#config.emaAlpha) * profile.avgCpu;
+            // Capture previous mean to compute variance against previous mean (avoid bias)
+            const prevAvg = profile.avgCpu;
+            // update avg using EMA
+            profile.avgCpu = this.#config.emaAlpha * cpuNorm + (1 - this.#config.emaAlpha) * prevAvg;
             profile.peakCpu = Math.max(cpuNorm, profile.peakCpu * this.#config.peakDecayFactor);
-            const delta = Math.abs(cpuNorm - profile.avgCpu);
+            // compute deviation against previous mean
+            const delta = Math.abs(cpuNorm - prevAvg);
             profile.variance = this.#config.varianceBeta * delta + (1 - this.#config.varianceBeta) * profile.variance;
         }
 

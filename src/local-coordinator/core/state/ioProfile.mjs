@@ -121,6 +121,13 @@ export default class IOProfile {
 
         if (Math.abs(err) > 0.5) this.#metrics.incr('ioprofile.large_error', 1);
 
+        // bump access order: reinsert to implement lightweight LRU
+        if (this.#store.has(keys[0])) {
+            const val = this.#store.get(keys[0]);
+            this.#store.delete(keys[0]);
+            this.#store.set(keys[0], val);
+        }
+
         return { ok: true, modelN: model.n, driftDetected };
     }
 
@@ -277,7 +284,11 @@ export default class IOProfile {
         const key = this.#makeKeyStrict(ctx);
         const m = this.#store.get(key);
         if (!m) return null;
-        return { n: m.n, emaG: m.emaG, emaVar: m.emaVar, bias: m.bias, lastSeen: m.lastSeen, source: m.source };
+        // bump access order on read
+        const copy = { n: m.n, emaG: m.emaG, emaVar: m.emaVar, bias: m.bias, lastSeen: m.lastSeen, source: m.source };
+        this.#store.delete(key);
+        this.#store.set(key, m);
+        return copy;
     }
 
     initFromContract(pluginId, extension, contract = {}) {
@@ -444,13 +455,17 @@ export default class IOProfile {
 
     #getOrCreateModel(key) {
         let m = this.#store.get(key);
-        if (!m) {
-            m = this.#createModelStats();
+        if (m) {
+            // bump to most-recently-used by reinserting
+            this.#store.delete(key);
             this.#store.set(key, m);
-            if (this.#store.size > this.#maxEntries) {
-                const firstKey = this.#store.keys().next().value;
-                this.#store.delete(firstKey);
-            }
+            return m;
+        }
+        m = this.#createModelStats();
+        this.#store.set(key, m);
+        if (this.#store.size > this.#maxEntries) {
+            const firstKey = this.#store.keys().next().value;
+            this.#store.delete(firstKey);
         }
         return m;
     }
@@ -458,11 +473,20 @@ export default class IOProfile {
     #findModelForPredict(keys) {
         for (const k of keys) {
             const m = this.#store.get(k);
-            if (m && m.n >= this.#cfg.MIN_SAMPLES_COLD) return { model: m, key: k };
+            if (m && m.n >= this.#cfg.MIN_SAMPLES_COLD) {
+                // bump access order
+                this.#store.delete(k);
+                this.#store.set(k, m);
+                return { model: m, key: k };
+            }
         }
         for (const k of keys) {
             const m = this.#store.get(k);
-            if (m) return { model: m, key: k };
+            if (m) {
+                this.#store.delete(k);
+                this.#store.set(k, m);
+                return { model: m, key: k };
+            }
         }
         return { model: this.#getOrCreateModel(keys[0]), key: keys[0] };
     }

@@ -1,581 +1,389 @@
-# DFPS 2.0: Local Coordinator — Process Pool Manager & Memory System
-### Document Version: 1.0 — First Stable Iteration
+### Overview
+
+This document is the definitive, implementation‑level specification for the **Process Pool Manager** and the **Memory System** used by the Local Coordinator. It replaces and expands the earlier v1.0 design you uploaded. It is written for engineers who will implement, test, operate, and maintain the subsystem. Every behavior, API, invariant, event, and failure path is described so the code and tests can be derived directly from this text.
+
+**Goals**
+- Provide a single authoritative reference for design, APIs, invariants, and operational procedures.
+- Remove ambiguity: every public method, event, and state transition is specified.
+- Make the system auditable and testable: include acceptance criteria and test vectors.
 
 ---
 
-## Document Scope
+### Architecture and Component Responsibilities
 
-This document covers the Process Pool Manager subsystem and its embedded
-Memory System. These components live inside the Runtime layer of the Local
-Coordinator and form the physical execution boundary beneath the Runtime
-Scheduler.
+#### High level responsibilities
 
-The Process Pool Manager is not an implementation detail. It is a core
-control boundary between logical scheduling and physical execution.
+- **Process Pool Manager**
+  - Enforce physical execution constraints.
+  - Provide synchronous validation APIs that return ACCEPTED/REJECTED.
+  - Emit lifecycle events for the Scheduler to act on.
+  - Coordinate Slot Manager, Register, Memory Controller, WorkerActions.
 
----
+- **Slot Manager**
+  - Authoritative mapping of slots to occupants.
+  - Provide atomic occupant replacement API.
+  - Enforce warm slot expiry and capacity invariants.
 
-## 1. Why This Layer Exists
+- **Worker Registry**
+  - Canonical worker state machine and indexes for queries.
+  - Strict state transitions and change log for external consumers.
 
-The Process Pool Manager did not emerge as a starting component. It was
-forced into existence by a constraint.
+- **Worker Actions**
+  - OS process lifecycle: spawn, monitor, IPC send/receive, kill, resource sampling.
+  - Emit events only; do not mutate orchestrator state.
 
-The planner required support for external computation engines — CP-SAT runs
-as a C++ process, plugins run as isolated OS processes. This immediately
-invalidated a thread-based model. The system required:
+- **Memory Controller and Memory Store**
+  - Memory Store: sampled system and per‑process memory state; single source of truth.
+  - Memory Controller: pure, stateless admission function that returns ACCEPT/REJECT.
 
-- True process isolation — plugin failure must not crash the LC
-- Controlled parallel execution — bounded concurrency enforced physically
-- Lifecycle control — spawn, monitor, drain, kill on deterministic signals
-- Memory admission — hard physical safety before any process starts
+#### Interaction patterns and responsibilities
 
-From that point, the Process Pool Manager stopped being an implementation
-detail and became the truth enforcer of the system.
-
-The architectural layering is:
-
-```
-Planner          → theoretical optimal (what should happen)
-Runtime Scheduler → adaptive executor  (what will happen)
-Process Pool Manager → truth enforcer  (what can happen physically)
-```
-
-The Planner and Runtime Scheduler operate on estimates and plans. The
-Process Pool Manager operates on physical reality. It does not optimize.
-It does not schedule. It enforces.
+- **Event First**: WorkerActions emits events; orchestrator reacts and emits higher‑level events for Scheduler.
+- **Claim Bind Spawn**: Scheduler requests readiness; orchestrator claims warm slot (tempKey) and emits `WORKER_SLOT_CLAIMED`; Scheduler binds workerId via `bindWorkerToSlot`; orchestrator spawns process via WorkerActions.
+- **No implicit reservations**: Memory Evaluator is stateless; Scheduler must re-query or defer.
 
 ---
 
-## 2. Core Philosophy
+### Data Models and Public APIs
 
-The Process Pool Manager is not smart. This is intentional.
+#### Slot Manager public model and API
 
-Early in the design, there was a question of whether the pool manager should
-make decisions — estimating execution time, predicting which plugin to warm,
-deciding what to run next. The answer was no, and it was the right answer.
+**SlotState fields**
+- **slotId**: integer stable identifier
+- **type**: `"WORKER"` or `"WARM"`
+- **state**: `"FREE"` or `"OCCUPIED"`
+- **occupantKey**: string (workerId or tempKey)
+- **pluginId**: string or null
+- **assignedAt**: timestamp or null
+- **warmExpiry**: timestamp or null
 
-Those responsibilities belong to the Runtime Scheduler and the Planner.
-If the pool manager absorbs them, it becomes:
+**Public methods**
+- `add(occupantKey, pluginId, isWarm = false) -> number | null`  
+  Allocates a slot for `occupantKey`. Returns numeric `slotId` or `null` if none available.
+- `freeSlots(occupantKey) -> boolean`  
+  Frees the slot occupied by `occupantKey`. Idempotent.
+- `freeSlotById(slotId) -> boolean`  
+  Convenience wrapper to free by numeric id.
+- `promote(workerId) -> boolean`  
+  Move occupant from warm slot to worker slot if capacity exists.
+- `replaceOccupant(slotId, expectedKey, newKey) -> boolean`  
+  **Atomic** replace: succeed only if current occupant equals `expectedKey`. Must update reverse index and metadata atomically.
+- `getSlotIdForWorker(occupantKey) -> number | null`
+- `getWorker(occupantKey) -> { pluginId, state, startedAt, lastUsedAt } | null`
+- `slotStats() -> { worker: { total, free, used }, warm: { total, free, used } }`
+- `debug() -> internal structures` for diagnostics
 
-- Overloaded with concerns it cannot reason about correctly
-- Tightly coupled to scheduling logic that should be independently evolvable
-- Impossible to test in isolation
+**Important invariants**
+- `freeWorkerSlot + usedWorkerSlot == workerSlotCount`
+- `freeWarmSlot + usedWarmSlot == warmSlotCount`
+- Reverse index must be authoritative for occupantKey → slotId lookup.
 
-By keeping the pool manager deterministic and narrow, it becomes:
+#### Worker Registry public model and API
 
-- Predictable — given the same inputs it always produces the same behavior
-- Composable — the Runtime Scheduler can reason about it as a black box
-- Safe — it never makes judgment calls that could corrupt execution state
+**WorkerRecord fields**
+- `workerId`, `pluginId`, `slotId`, `state` (`CREATED`, `STARTING`, `IDLE`, `BUSY`, `WARM`, `TERMINATING`, `DEAD`), `createdAt`, `lastUsedAt`, `metadata`.
 
-The pool manager answers one question: **can this physical action be
-executed safely right now?** Everything else is owned elsewhere.
+**Public methods**
+- `createWorkerRecord({ workerId, pluginId, slotId }) -> true | throws`  
+  Must throw on slot collision or duplicate workerId.
+- `updateState(workerId, newState) -> true | throws`  
+  Enforce allowed transitions; throw on invalid.
+- `updateSlot(workerId, newSlotId) -> true | throws`
+- `assignWork(workerId, taskData) -> true | throws`
+- `completeWork(workerId) -> true | throws`
+- `getWorker(workerId) -> WorkerRecord | null`
+- `getWorkersByPlugin(pluginId) -> WorkerRecord[]`
+- `findIdleWorker(pluginId) -> workerId | null`
+- `getStateCounts() -> { state: count }`
+- `getStalledWorkers(timeoutMs) -> WorkerRecord[]`
+- `clear()` and `debugDump()` for tests
 
----
+**State transition rules**
+- `CREATED` → `STARTING` | `DEAD`
+- `STARTING` → `IDLE` | `DEAD`
+- `IDLE` → `BUSY` | `WARM` | `TERMINATING`
+- `BUSY` → `IDLE` | `TERMINATING`
+- `WARM` → `IDLE` | `TERMINATING`
+- `TERMINATING` → `DEAD` | `IDLE` (idempotency for aborted termination)
 
-## 3. Internal Structure
+Registry must purge worker on `DEAD` and remove indexes.
 
-The Process Pool Manager contains four components:
+#### WorkerActions public model and API
 
-```
-PROCESS-POOL-MANAGER/
-  SLOT-MANAGER       — where execution can happen (concurrency boundary)
-  MEMORY-STORE       — source of truth for all memory state
-  MEMORY-EVALUATOR   — stateless safety gate
-  WORKER-REGISTRY    — what is currently happening (upcoming)
-  IPC-LAYER          — how execution happens (upcoming)
-```
+**Responsibilities**
+- Spawn OS process with given `cmd` and `args`.
+- Provide `send(workerId, message)` to write to child stdin with bounded timeout and backpressure handling.
+- Monitor stdout/stderr and emit parsed `RUNTIME_UPDATE` or raw logs.
+- Emit lifecycle events: `SPAWNED`, `SPAWN_TIMEOUT`, `RUNTIME_UPDATE`, `RUNTIME_ERROR`, `OS_ERROR`, `CLOSED`, `RAW_LOG`, `STDERR_LOG`.
+- Provide `resource(workerIds)` to return CPU/memory metrics for PIDs.
 
----
+**Public methods**
+- `create(workerId, pluginData, opts = {}, config = { initTimeout }) -> true | ProjectError`  
+  Synchronous path returns `ProjectError` on immediate failure or `true` on success. Prefer throwing `ProjectError` for consistency or document return semantics clearly.
+- `send(workerId, message) -> Promise<boolean> | throws ProjectError`  
+  Must throw `ProjectError` on missing worker or permanent failure.
+- `kill(workerId, timeoutMs) -> true | ProjectError`
+- `killAll()`
+- `getInternalStats() -> { activeCount, workerIds }`
+- `resource(workerIds) -> Promise<report> | throws ProjectError`
+- `unmonitorAll()` to cleanup pidusage timers
 
-## 4. Slot Manager
+**Stream handling rules**
+- Buffer partial lines; parse newline-delimited JSON messages; fallback to `RAW_LOG`/`STDERR_LOG` for non-JSON.
+- On `close`, flush buffers as `RAW_LOG`/`STDERR_LOG` if non-empty.
+- All handlers must re-fetch `entry` from internal map and guard for missing entry.
 
-### 4.1 Why Slot Manager Exists
+#### Memory Store and Memory Controller
 
-CPU is a soft constraint. Memory is a hard constraint. These require
-different enforcement models.
+**MemorySnapshot fields**
+- `total_memory_mb`, `mem_available_mb`, `mem_free_mb`, `fragmentation_ratio`, `per_process: Map<workerId, { pid, rss_mb, peak_rss_mb }>, timestamp`
 
-For CPU, rather than measuring utilization continuously and making
-admission decisions based on a moving signal, the system enforces a fixed
-number of concurrent execution slots. This gives:
+**MemoryController API**
+- `evaluatePlugin(baseOverheadMB, snapshot) -> { decision: "ACCEPT" | "REJECT", reason?, details? }`
+- `evaluateTask(requiredMB, snapshot) -> { decision, reason? }`
+- `evaluateCombined(baseOverheadMB, fullRequiredMB, snapshot) -> { decision, reason? }`
 
-- Predictability — the maximum concurrency is always known
-- Simplicity — no continuous CPU measurement required
-- Stability — no oscillation from dynamic CPU-based admission
+**Admission algorithm**
+1. Compute `requiredMB = max(baseOverheadMB, minimumOverheadMB)` for spawn-only; for combined use `max(spawnCost, taskCost)`.
+2. Compute `safetyMarginMB` (configurable absolute or ratio).
+3. Compute `effectiveAvailable = max(snapshot.mem_available_mb - safetyMarginMB, 0)`.
+4. If `requiredMB > snapshot.total_memory_mb - safetyMarginMB` → `REJECT` with reason `EXCEEDS_SYSTEM_CAPACITY`.
+5. If `requiredMB <= effectiveAvailable` → `ACCEPT`.
+6. Else → `REJECT` with reason `INSUFFICIENT_MEMORY`.
 
-Each slot represents one unit of execution capacity. At any moment, the
-number of active processes cannot exceed the number of slots. This is a
-hard invariant enforced by the Slot Manager.
-
-### 4.2 Dual Slot Model
-
-The Slot Manager distinguishes between two slot types:
-
-**Worker Slots** — active execution. A process is running a task.
-
-**Warm Slots** — preloaded but idle. A process has been spawned and is
-ready to accept a task immediately, without incurring spawn latency.
-
-This distinction is not trivial. Warm slots introduce a temporal
-optimization layer — the system can pre-position execution capacity ahead
-of demand based on the Planner's execution timeline. A warm slot converts
-spawn latency into zero latency for the next task dispatch.
-
-Warm slots consume memory. They must be time-bounded — a warm process that
-is not consumed within its expiry window is killed to reclaim resources.
-The Planner controls when warm slots are created via PRE_SPAWN events in
-the execution plan. The Slot Manager enforces the expiry.
-
-### 4.3 Slot State
-
-Each slot is:
-
-- **Indexed** — stable identity that persists across task executions
-- **Tracked explicitly** — no implicit or inferred state
-- **Either assigned or free** — binary from the Slot Manager's perspective
-
-```
-SlotState {
-  slotId:        integer         — stable identifier
-  type:          WORKER | WARM   — slot classification
-  state:         FREE | OCCUPIED — current occupancy
-  workerId:      string | null   — assigned worker process ID
-  assignedAt:    timestamp | null
-  warmExpiry:    timestamp | null — null for worker slots
-}
-```
-
-Internal data structures:
-
-```
-activeSlots:  Map<slotId, SlotState>   — O(1) lookup by slot ID
-freeSlots:    Set<slotId>              — O(1) allocation of next free slot
-```
-
-This structure gives O(1) slot allocation and O(1) slot release without
-scanning. Slot state is authoritative — the Map is the truth, not a cache.
-
-### 4.4 Slot Manager Responsibilities
-
-The Slot Manager owns:
-
-- Slot allocation on spawn request
-- Slot release on process exit or kill confirmation
-- Warm slot expiry enforcement
-- Reporting current occupancy to the Memory System and Runtime Scheduler
-
-The Slot Manager does NOT own:
-
-- Deciding which plugin to load on a slot (Planner/Runtime Scheduler)
-- Deciding when to spawn (Runtime Scheduler acting on plan events)
-- Process creation mechanics (IPC Layer — upcoming)
+**Notes**
+- Evaluator is pure and must not mutate Memory Store.
+- Scheduler must handle `REJECT` by deferring or failing the spawn request.
 
 ---
 
-## 5. Memory System
+### Event Model and Metrics
 
-The Memory System is the admission gate for all physical execution. It
-determines whether a process can safely be spawned given the current
-and projected memory state of the node.
+#### Canonical events emitted by orchestrator
 
-### 5.1 Memory Is a Hard Constraint
+- **Slot and spawn lifecycle**
+  - `WORKER_SLOT_CLAIMED { slotId, tempKey, pluginId, caller }`
+  - `WORKER_SLOT_CLAIM_EXPIRED { slotId, pluginId, tempKey }`
+  - `WORKER_SLOT_BIND_FAILED { workerId, slotId, pluginId, reason }`
+  - `WORKER_REGISTERED { workerId, slotId, pluginId }`
+  - `WORKER_SPAWN_INITIATED { workerId, slotId, pluginId }`
+  - `WORKER_SPAWN_FAILED { workerId, slotId, pluginId, message }`
+  - `WORKER_SPAWN_TIMEOUT { workerId, pluginId, message }`
+  - `WORKER_SPAWN_STATE_ERROR { workerId, err }`
 
-CPU contention causes slowdown. Memory exhaustion causes process kills,
-system instability, and unrecoverable states.
+- **Worker readiness and assignment**
+  - `WORKER_READY { workerId, pluginId, pid? }`
+  - `WORKER_WARM_READY { workerId, pluginId, pid? }`
+  - `WORKER_PROMOTED { workerId, pluginId }`
+  - `WORKER_ASSIGNED { workerId, taskId, pluginId }`
+  - `WORKER_IDLE { workerId, pluginId }`
 
-This asymmetry means memory must be treated differently from CPU:
+- **Errors and termination**
+  - `WORKER_RUNTIME_ERROR { workerId, pluginId, err }`
+  - `WORKER_OS_ERROR { workerId, err }`
+  - `WORKER_COMM_ERROR { workerId, err }`
+  - `WORKER_CLOSED_CLEAN { workerId, pluginId }`
+  - `WORKER_CRASHED { workerId, pluginId, code, signal, reason }`
+  - `WORKER_DEAD { workerId, pluginId, reason }`
+  - `WORKER_EVICTED { workerId, pluginId, reason }`
+  - `WORKER_DRAINING { workerId, pluginId }`
 
-- CPU is managed through slot limits (soft, approximate)
-- Memory is managed through explicit admission evaluation (hard, strict)
+- **IPC send metrics**
+  - `WORKER_SEND_SUCCESS { workerId, attempt, latency }`
+  - `WORKER_SEND_RETRY { workerId, attempt, err }`
+  - `WORKER_SEND_FAILED { workerId, attempts, err }`
+  - `WORKER_SEND_REJECTED_STATE { workerId, state }`
+  - `WORKER_SEND_ABORTED_STATE_CHANGE { workerId, newState }`
 
-Every spawn request passes through memory admission before any process
-is created. This is not optional instrumentation — it is the primary
-safety gate of the execution system.
+- **Observability**
+  - `METRIC { name, value, tags }` for lightweight metrics emission.
 
-### 5.2 Layered Memory Views
+#### Metrics to record (minimum)
 
-Different layers of the system see memory differently, and this is correct:
-
-| Layer | View | Purpose |
-|---|---|---|
-| Planner | Predictive | Estimates future memory usage for plan construction |
-| Runtime Scheduler | Buffered | Observed usage with EMA smoothing for scheduling decisions |
-| Process Pool Manager | Strict | Hard enforcement against current physical state |
-
-These views do not contradict each other — they serve different time
-horizons. The Planner reasons about what memory will look like. The
-Runtime Scheduler reasons about what memory has been looking like. The
-Process Pool Manager reasons about what memory looks like right now.
-
-The Memory Store is the single source of truth that feeds all three layers.
-
----
-
-## 6. Memory Store
-
-### 6.1 Why Memory Store Exists
-
-The Memory Controller must be stateless. Stateless means it holds no
-memory of past requests or past states between evaluations. This prevents
-drift, avoids duplicated truth, and forces a single source of authority.
-
-But stateless evaluation requires state to read from. That state lives in
-the Memory Store.
-
-If the Memory Store did not exist:
-
-- The Planner would have its own memory model
-- The Runtime Scheduler would have its own memory model
-- The Pool Manager would have its own memory model
-
-All three would diverge. The system would become inconsistent. The Memory
-Store prevents this by being the one place all memory knowledge lives.
-
-### 6.2 What the Memory Store Holds
-
-**Plugin Memory Profiles:**
-
-```
-PluginMemoryProfile {
-  pluginName:      string
-  baseOverhead:    MB     — fixed cost regardless of file size
-                            (plugin runtime, loaded libraries, init memory)
-  memoryPerMB:     MB     — variable cost per MB of input file size
-  peakMultiplier:  float  — historical spike ratio (peak / average)
-                            tracked via EMA over observed executions
-  lastUpdated:     timestamp
-  sampleCount:     integer
-}
-```
-
-Memory usage is not purely linear with file size. A DICOM header parser
-uses nearly the same memory whether the file is 10MB or 500MB — most of
-its footprint is the plugin runtime. The model uses:
-
-```
-EstimatedMemory(plugin, fileSizeMB) =
-  baseOverhead + (memoryPerMB × fileSizeMB)
-
-PeakMemory(plugin, fileSizeMB) =
-  EstimatedMemory × peakMultiplier
-```
-
-This matches the same base_overhead + variable component structure used
-in the Planner's COSTING component for consistency across layers.
-
-**Runtime Observations:**
-
-```
-RuntimeMemoryState {
-  totalSystemMemory:    MB
-  usedMemory:           MB     — current RSS across all LC processes
-  availableMemory:      MB     — from /proc/meminfo MemAvailable
-  freeMemory:           MB     — from /proc/meminfo MemFree
-  fragmentationSignal:  float  — ratio: availableMemory / freeMemory
-                                  high ratio = kernel relying on cache reclaim
-                                  proxy signal for allocation pressure
-  lastSampled:          timestamp
-}
-```
-
-**Per-Process Observations (fed by Metrics Aggregate):**
-
-```
-ProcessMemoryRecord {
-  workerId:     string
-  pluginName:   string
-  currentRSS:   MB
-  peakRSS:      MB
-  startedAt:    timestamp
-}
-```
-
-### 6.3 Fragmentation Signal
-
-Memory fragmentation cannot be directly measured from user space on Linux.
-The Memory Store uses a heuristic proxy:
-
-```
-fragmentationSignal = availableMemory / freeMemory
-```
-
-`MemAvailable` (from `/proc/meminfo`) is what the kernel estimates is
-available for new allocations including cache reclaim. `MemFree` is what
-is immediately free without reclaim.
-
-When these values diverge significantly (high ratio), the kernel is relying
-heavily on reclaiming cached pages to satisfy allocations. Large contiguous
-allocations — which plugin processes require — are more likely to fail or
-cause latency spikes under high fragmentation pressure.
-
-The signal is approximate. It is a heuristic, not a direct measurement.
-The Memory Evaluator applies conservative safety margins when the signal
-is elevated rather than treating it as a precise constraint.
-
-### 6.4 Sampling
-
-The Memory Store samples system state on a configurable interval
-(default 500ms). Sampling reads from `/proc/meminfo` — fast, non-blocking,
-no system call overhead that would affect the event loop.
-
-Per-process memory is read from `/proc/{pid}/status` (VmRSS field) and
-fed into the Memory Store by the Metrics Aggregate component on each
-measurement cycle.
+- `worker.slot.claimed`, `worker.slot.claim.expired`
+- `worker.spawn.initiated`, `worker.spawned`, `worker.spawn.timeout`, `worker.spawn.failed`
+- `worker.assigned`, `worker.rejected.memory`, `worker.spawn.rejected.no_slot`
+- `worker.send.success`, `worker.send.retry`, `worker.send.failure`
+- `worker.dead` with `reason` tag
+- `need.plugin.instance` counter for scheduler demand signal
 
 ---
 
-## 7. Memory Evaluator
+### Lifecycle Sequences and Atomicity Guarantees
 
-### 7.1 What It Is
+#### Claim Bind Spawn sequence (step by step)
 
-The Memory Evaluator is a stateless pure function. Given a spawn request
-and the current Memory Store snapshot, it returns an admission decision.
+1. **Scheduler** calls `ensurePluginReady(pluginId, options)`:
+   - Orchestrator checks Register for `IDLE` or `WARM` workers; if found emit `WORKER_READY`/`WORKER_WARM_READY` and return `ACCEPTED`.
+   - If none, run memory admission for spawn-only if `snapshot` provided.
+   - If admission passes, call `_claimWarmSlotWithTimeout(pluginId)`:
+     - Generate `tempKey = temp:${pluginId}:${uuid}`.
+     - Call `slots.add(tempKey, pluginId, true)` → returns `slotId` or `null`.
+     - If `slotId` returned, set TTL timer `claimTTLMs` that will free the slot if unbound.
+     - Store claim in `#_tempClaims.set(tempKey, { slotId, timer, pluginId })`.
+     - Emit `WORKER_SLOT_CLAIMED { slotId, tempKey }`.
+     - Return `ACCEPTED`.
 
-It holds no state between calls. It has no memory of previous decisions.
-It does not wait, retry, queue, or subscribe to events. It evaluates and
-returns.
+2. **Scheduler** obtains `workerId` and calls `bindWorkerToSlot(workerId, slotId, pluginData)`:
+   - Find `tempKey` owning `slotId` by scanning `#_tempClaims`.
+   - Cancel claim timer and map `#_workerTempKeyMap.set(workerId, tempKey)` to allow cleanup on spawn timeout.
+   - Attempt **atomic replace**:
+     - If `slots.replaceOccupant(slotId, tempKey, workerId)` returns `true`:
+       - `newSlotId = slotId`.
+     - Else fallback:
+       - `slots.freeSlots(tempKey)` then `newSlotId = slots.add(workerId, pluginId, false)`.
+       - If `newSlotId` is `null` → attempt to restore tempKey occupant `slots.add(tempKey, pluginId, true)` and emit `WORKER_SLOT_BIND_FAILED`.
+   - Create registry record `createWorkerRecord({ workerId, pluginId, slotId: newSlotId })`.
+   - `updateState(workerId, "STARTING")`.
+   - Call `WorkerActions.create(workerId, pluginData, ...)`.
+   - Emit `WORKER_SPAWN_INITIATED`.
 
-```
-MemoryEvaluator.evaluate(spawnRequest, memorySnapshot) → Decision
-```
+3. **WorkerActions** spawns process and emits `SPAWNED`:
+   - Orchestrator receives `SPAWNED` event.
+   - Validate worker exists and state is `STARTING`.
+   - Query `slots.getWorker(workerId)` for slot meta to determine if warm.
+   - `markReady(workerId)` → `IDLE`.
+   - If slot meta indicates warm → `markWarm(workerId)` → `WARM`.
+   - Emit `WORKER_READY` or `WORKER_WARM_READY`.
 
-### 7.2 The Three-Response Interface
+4. **Failure handling**
+   - If `SPAWN_TIMEOUT` occurs → orchestrator emits `WORKER_SPAWN_TIMEOUT` and calls `forceCleanup(workerId, "SPAWN_TIMEOUT")`.
+   - If `WorkerActions.create` returns synchronous `ProjectError` → orchestrator logs, `forceCleanup`, emit `WORKER_SPAWN_FAILED`.
+   - All cleanup paths must be idempotent.
 
-```
-ACCEPT — safe to spawn, proceed immediately
-REJECT — structurally impossible (request violates hard constraints)
-DEFER  — temporarily impossible (resource pressure, expected to resolve)
-```
+#### Atomicity and race handling
 
-The distinction between REJECT and DEFER is critical:
-
-- REJECT means the request itself is invalid — the plugin's memory
-  requirement exceeds total system memory, or the plugin profile is
-  malformed. No future memory state will make this request valid.
-
-- DEFER means the system conditions are temporarily unfavorable. The
-  request is valid under system policy. Admission is expected to become
-  possible after natural memory release events such as worker completion
-  or plugin unload.
-
-### 7.3 Evaluation Logic
-
-```
-Given:
-  plugin         — plugin being spawned
-  fileSizeMB     — input file size
-  memorySnapshot — current Memory Store state
-
-Compute:
-  estimated = plugin.baseOverhead + (plugin.memoryPerMB × fileSizeMB)
-  peak      = estimated × plugin.peakMultiplier
-  safetyMargin = totalSystemMemory × SAFETY_MARGIN_RATIO  (default 0.10)
-
-  effectiveAvailable = availableMemory - safetyMargin
-  fragmentationRisk  = fragmentationSignal > FRAGMENTATION_THRESHOLD
-
-Evaluate:
-  if peak > totalSystemMemory - safetyMargin:
-    return REJECT  (structurally impossible, no future state resolves this)
-
-  if peak > effectiveAvailable:
-    return DEFER   (insufficient memory now, may resolve after releases)
-
-  if fragmentationRisk AND peak > LARGE_ALLOCATION_THRESHOLD:
-    return DEFER   (allocation may fail due to fragmentation pressure)
-
-  return ACCEPT
-```
-
-### 7.4 What the Evaluator Does Not Do
-
-The Memory Evaluator does not:
-
-- Track which requests it has previously evaluated
-- Know whether this is a retry or first attempt
-- Have opinions about when to retry
-- Access anything outside the Memory Store snapshot it is given
-
-This purity is what makes the evaluator composable and testable. Given
-the same snapshot and the same request, it always returns the same
-decision.
+- **Primary atomic operation**: `replaceOccupant(slotId, expectedKey, newKey)` must be implemented by Slot Manager and used as the primary path in `bindWorkerToSlot`.
+- **Fallback path**: free tempKey then add workerId. This path is racy; orchestrator must:
+  - Attempt to restore tempKey occupant on failure.
+  - Emit metric `worker.slot.bind.fallback` when fallback used.
+  - Log and alert if fallback frequency exceeds threshold.
 
 ---
 
-## 8. DEFER Ownership — The Runtime Scheduler
+### Failure Modes, Reconciliation, and Operational Procedures
 
-The Memory Evaluator returns DEFER and its job is done. Something else
-must act on that response.
+#### Common failure modes and detection
 
-That something is the **Runtime Scheduler**.
+- **Temp claim expiry**: TTL timer fires; Slot Manager frees tempKey; orchestrator emits `WORKER_SLOT_CLAIM_EXPIRED`.
+- **Bind race**: `replaceOccupant` fails and fallback fails; orchestrator emits `WORKER_SLOT_BIND_FAILED`.
+- **Spawn timeout**: WorkerActions emits `SPAWN_TIMEOUT`; orchestrator `forceCleanup`.
+- **Broken IPC**: `send` fails repeatedly; orchestrator emits `WORKER_SEND_FAILED` and optionally `forceCleanup` if configured.
+- **Slot/Register divergence**: `totalRegistered > totalSlots` detected by `_assertInvariants()`; orchestrator emits `RECONCILE_REPORT`.
 
-> "All DEFER responses are owned by the Runtime Scheduler, which maintains
-> a deferred request set and re-submits them upon memory-release events
-> such as worker completion or plugin unload."
+#### Reconciliation algorithm
 
-The complete DEFER cycle:
+Run periodically or on demand:
 
-```
-Step 1 — Runtime Scheduler submits spawn request
-  Request → Memory Evaluator
-  Memory Evaluator → returns DEFER
+1. Fetch `slotStats` and `register.getStateCounts()`.
+2. If `totalRegistered > totalSlots` or other mismatch:
+   - Build reverse maps:
+     - `slotOccupants = slots.debug().index`
+     - `registeredWorkers = register.getWorkersByPlugin(...)` or `register.debugDump()`
+   - For each registered worker:
+     - If `slots.getSlotIdForWorker(workerId) == null` → mark worker as orphan; call `forceCleanup(workerId, "ORPHANED")`.
+   - For each slot occupant not present in register:
+     - If occupantKey looks like `temp:*` → free slot.
+     - Else if occupantKey is workerId and WorkerActions.exists(workerId) is false → free slot.
+3. Emit `RECONCILE_ACTIONS` with counts and results.
 
-Step 2 — Runtime Scheduler takes ownership
-  Does NOT retry immediately
-  Does NOT loop or sleep blindly
-  Registers request in deferred set
-  Associates request with memory-pressure condition
+#### Operational runbook
 
-Step 3 — Runtime Scheduler subscribes to memory-releasing events
-  onWorkerExit
-  onTaskComplete
-  onPluginUnload
-  onMemoryUpdate (from Memory Store)
-
-Step 4 — Memory release event fires
-  Example: worker finishes, plugin unloaded, Memory Store updates
-
-Step 5 — Runtime Scheduler re-evaluates deferred set
-  Selects candidates (priority-ordered, controlled batch size)
-  Re-submits requests to Memory Evaluator
-
-Step 6 — Memory Evaluator re-evaluates statelessly
-  No memory of previous DEFER
-  Fresh evaluation against current snapshot
-  Returns ACCEPT, DEFER, or REJECT
-```
-
-**Anti-stampede rule:** When memory frees, the Runtime Scheduler does
-not retry all deferred requests simultaneously. It processes them in
-controlled batches, prioritized by task priority score, to prevent burst
-allocation that would immediately exhaust the newly freed memory and
-trigger another round of DEFERs.
-
-The mental model:
-
-```
-Memory Evaluator  = Gate     ("yes / no / wait")
-Runtime Scheduler = Traffic Controller ("I'll bring you back when the road clears")
-```
+- **High memory pressure**: Scheduler should back off and subscribe to Memory Store events. Do not attempt to bypass Memory Evaluator.
+- **Orphaned processes**: Run reconciliation; if orphaned PIDs exist, kill and free slots.
+- **Graceful shutdown**:
+  - Call `drainWorker` for each worker with `gracefulMs`.
+  - Wait for `WORKER_CLOSED_CLEAN` or timeout then `kill`.
+- **Monitoring**:
+  - Alert on `worker.spawn.timeout` rate, `worker.slot.bind.fallback` rate, and `worker.dead` spikes.
 
 ---
 
-## 9. Architectural Boundaries — What This Layer Does Not Own
+### Testing, Validation, and Acceptance Criteria
 
-| Concern | Owner |
-|---|---|
-| Deciding what task to run next | Runtime Scheduler / Planner |
-| Deciding when to spawn | Runtime Scheduler (plan event timing) |
-| Plugin selection and batching | Planner |
-| Task retry logic | Runtime Scheduler |
-| Sending completion signals to MC | Metrics Aggregate → LC Coordinator |
-| CPU utilization tracking | Metrics Aggregate |
-| Execution ordering | Runtime Scheduler consuming plan |
+#### Unit tests required per module
 
-The Process Pool Manager enforces physical constraints. It does not make
-logical scheduling decisions.
+- **Slot Manager**
+  - `add` returns slotId and updates reverse index.
+  - `replaceOccupant` success when expectedKey matches; failure when mismatch.
+  - `promote` moves warm occupant to worker slot and updates metadata.
+  - `freeSlots` and `freeSlotById` idempotency.
 
----
+- **Worker Registry**
+  - `createWorkerRecord` throws on slot collision and duplicate workerId.
+  - `updateState` enforces allowed transitions and throws on invalid.
+  - `assignWork` and `completeWork` update metadata and timestamps.
+  - `getStalledWorkers` identifies long-running BUSY tasks.
 
-## 10. Interaction Map
+- **WorkerActions**
+  - `create` emits `SPAWNED` and handles `initTimeout` by emitting `SPAWN_TIMEOUT`.
+  - `send` resolves on success, times out correctly, and throws `ProjectError` on missing worker.
+  - Stream parsing handles partial lines and JSON vs raw logs.
+  - `resource` returns metrics for provided workerIds.
 
-```
-Planner
-  → emits PRE_SPAWN and SPAWN events (via execution plan)
-  → reads plugin memory profiles from Memory Store (via COSTING)
+- **MemoryController**
+  - `evaluatePlugin`, `evaluateTask`, `evaluateCombined` with edge snapshots and safety margin enforcement.
 
-Runtime Scheduler
-  → submits spawn requests to Memory Evaluator
-  → acts on ACCEPT / REJECT / DEFER responses
-  → maintains deferred request set
-  → reacts to memory-release events from Memory Store
-  → instructs Slot Manager to allocate / release slots
+- **ProcessPoolOrchestrator**
+  - `ensurePluginReady` emits `WORKER_SLOT_CLAIMED` and TTL expiry emits `WORKER_SLOT_CLAIM_EXPIRED`.
+  - `bindWorkerToSlot` atomic replace path and fallback path.
+  - Full spawn lifecycle: `WORKER_SPAWN_INITIATED` → `SPAWNED` → `WORKER_READY`.
+  - `send` retry/backoff and abort on state change.
 
-Memory Store
-  → sampled continuously from /proc/meminfo
-  → updated by Metrics Aggregate with per-process RSS observations
-  → read by Memory Evaluator at evaluation time
-  → read by Planner's COSTING for planning estimates
+#### Integration tests
 
-Memory Evaluator
-  → reads Memory Store snapshot
-  → returns ACCEPT / REJECT / DEFER
-  → holds no state between calls
+- **Claim Bind Spawn Race**: Simulate concurrent `replaceOccupant` contention and assert orchestrator recovers.
+- **Memory pressure scenario**: Provide snapshots that cause `REJECT` and verify scheduler receives `WORKER_SPAWN_REJECTED_MEMORY`.
+- **End to end**: Orchestrator + Mock WorkerActions + SlotManager + Register: run a sequence of `ensurePluginReady` → `bindWorkerToSlot` → emit `SPAWNED` → `runTask` assignment → `completeTask` → `drainWorker` and assert no slot leaks.
 
-Slot Manager
-  → allocates slots on Runtime Scheduler instruction
-  → releases slots on process exit confirmation
-  → enforces warm slot expiry
-  → reports occupancy to Runtime Scheduler
-```
+#### Acceptance criteria
+
+- All unit tests pass with 100% coverage for public APIs.
+- Integration tests show no slot leaks after 10k simulated spawn cycles.
+- Reconciliation reduces register/slot mismatch to zero within one run.
+- Observability emits required metrics and events for each scenario.
 
 ---
 
-## 11. Upcoming Components
+### Appendices
 
-### 11.1 Worker Registry
+#### Example API call flows
 
-Will track the live state of all running worker processes:
-
-```
-WorkerRecord {
-  workerId:     string
-  slotId:       integer
-  pluginName:   string
-  state:        SPAWNING | READY | EXECUTING | DRAINING | KILLING
-  pid:          integer
-  spawnedAt:    timestamp
-  currentTask:  TaskId | null
-  memoryUsage:  MB
-}
+**Example ensurePluginReady call**
+```js
+const res = orchestrator.ensurePluginReady("pluginX", {
+  isWarm: true,
+  snapshot: { total_memory_mb: 16000, mem_available_mb: 4000 },
+  base_overhead_mb: 120,
+  caller: "scheduler-1"
+});
+// res === "ACCEPTED" or "REJECTED"
 ```
 
-The Worker Registry is the authoritative record of what is currently
-happening in the execution surface. The Runtime Scheduler queries it to
-determine which slots are available, which plugins are warm, and which
-workers are eligible for task dispatch.
+**Example bindWorkerToSlot call**
+```js
+const bindRes = orchestrator.bindWorkerToSlot("worker-123", 5, {
+  pluginId: "pluginX",
+  cmd: "node",
+  args: ["index.js"],
+  initTimeout: 8000
+}, "scheduler-1");
+// bindRes === "ACCEPTED" or "REJECTED"
+```
 
-### 11.2 IPC Layer
-
-Will handle all communication between the LC process and worker child
-processes:
-
-- Establishing IPC channels at spawn time
-- Dispatching task messages to workers
-- Receiving ready signals, execution_complete signals, and failure signals
-- Detecting channel failures and triggering crash recovery
-- Clean channel teardown on graceful process exit
-
----
-
-## 12. Known Limitations (v1.0)
-
-| Limitation | Notes |
-|---|---|
-| Fragmentation signal is approximate | Linux does not expose direct fragmentation metrics from user space. The available/free ratio is a proxy. Allocation failures are the true signal and will be caught at spawn time and fed back as REJECT. |
-| No GPU memory dimension | Medical imaging GPU tasks deferred to collaborator component. GPU memory tracking added when GPU-aware plugins are integrated. |
-| Static safety margin | SAFETY_MARGIN_RATIO is set at deployment time. Adaptive margin based on observed allocation failure rate is a future enhancement. |
-| No cross-slot memory pooling | Each slot's memory is tracked independently. Shared memory between slots is not modeled. |
+#### Event timeline example
+1. `ensurePluginReady` → `WORKER_SLOT_CLAIMED { slotId: 7, tempKey }`
+2. Scheduler obtains workerId and calls `bindWorkerToSlot(workerId, 7, pluginData)`
+3. Orchestrator calls `WorkerActions.create(workerId, pluginData)`
+4. Orchestrator emits `WORKER_SPAWN_INITIATED`
+5. WorkerActions emits `SPAWNED` → orchestrator marks ready and emits `WORKER_READY`
+6. Scheduler calls `runTask` → orchestrator assigns and emits `WORKER_ASSIGNED`
 
 ---
 
-## 13. Design Philosophy
+If you want, I will now:
+- Produce a **line‑by‑line checklist** that maps every requirement above to the exact code locations and tests to add.
+- Generate **unit test skeletons** (Jest ESM) for each module that fail initially and can be used to drive fixes.
+- Produce a **git patch** that applies the critical fixes I recommended earlier (typo fixes, atomic replaceOccupant usage, send semantics) and adds the test harness.
 
-**The pool manager is the last line of defense.** The Planner estimates
-memory usage. The Runtime Scheduler respects those estimates in its
-scheduling decisions. But estimates are wrong sometimes. The Memory
-Evaluator catches the cases where reality diverges from estimates and
-prevents unsafe spawns from happening regardless of what the plan says.
-
-**Stateless evaluation over stateful reservation.** Reservation systems
-make sense when multiple independent decision-makers compete for the
-same resource. In this system, the LC is the sole admission authority.
-Reservation adds complexity without solving a real problem. Stateless
-evaluation is simpler, more predictable, and equally safe.
-
-**Memory has shape, not just quantity.** Available memory is not a scalar
-— it has allocation structure. A system with 2GB free may not be able to
-satisfy a 1.5GB contiguous allocation. The fragmentation signal and the
-peak multiplier together model this reality conservatively without
-requiring direct kernel-level fragmentation data.
-
----
+Tell me which of those you want next and I will produce it.

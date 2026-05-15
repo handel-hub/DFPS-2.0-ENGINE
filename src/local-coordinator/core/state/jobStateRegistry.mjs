@@ -599,8 +599,8 @@ class JobStateRegistry {
         if (coalesce) {
         const map = new Map();
         for (const e of events) {
-            // key: jobId:taskId; if taskId missing, include sequence to avoid merging unrelated job-level events
-            const key = e.taskId ? `${e.jobId}:${e.taskId}` : `${e.jobId}::${e.sequenceId}`;
+            // key: jobId:taskId; if taskId missing, use stable job-level key to allow coalescing job-level events
+            const key = e.taskId ? `${e.jobId}:${e.taskId}` : `${e.jobId}::JOB`;
             if (!map.has(key)) {
             // clone to avoid mutating original changeLog entries
                 map.set(key, JSON.parse(JSON.stringify(e)));
