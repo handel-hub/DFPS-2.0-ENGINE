@@ -190,6 +190,28 @@ class Register {
         return result;
     }
 
+    /**
+     * Return an array of cloned worker records for a given pluginId.
+     * Useful for orchestrator queries that need to find candidates by plugin.
+     */
+    getWorkersByPlugin(pluginId) {
+        if (!pluginId) return [];
+        const set = this.#pluginIndex.get(pluginId);
+        if (!set) return [];
+        return Array.from(set).map(id => this.getWorker(id)).filter(Boolean);
+    }
+
+    /**
+     * Find a single IDLE worker for the given pluginId.
+     * Returns workerId string or null if none found.
+     */
+    findIdleWorker(pluginId) {
+        const workers = this.getWorkersByPlugin(pluginId);
+        for (const w of workers) {
+            if (w && w.state === 'IDLE') return w.workerId;
+        }
+        return null;
+    }
     getStalledWorkers(timeoutMs) {
         const now = Date.now();
         const busyIds = this.#stateIndex.get('BUSY');
