@@ -163,7 +163,7 @@ class SlotManager {
         return true;
     }
 
-      /**
+    /**
      * Free a slot by numeric slotId. Convenience wrapper.
      */
     freeSlotById(slotId) {
@@ -230,6 +230,17 @@ class SlotManager {
     getWorker(workerId) {
         return this.#workers.get(workerId) || null;
     }
+
+    /**
+   * Return the numeric slotId for a given workerId (or tempKey).
+   * If the workerId is not present in the index, returns null.
+   */
+    getSlotIdForWorker(workerId) {
+        if (!workerId) return null;
+        const rec = this.#workerIndex.get(workerId);
+        return rec ? rec.slotId : null;
+    }
+
 
     // ===== STATS =====
     slotStats() {
