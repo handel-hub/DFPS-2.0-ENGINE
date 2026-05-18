@@ -35,7 +35,7 @@
         "scaling_unit": { "type": "string" },
         "unit_count": { "type": "integer", "minimum": 0 },
         "complexity_factor": { "type": "number", "minimum": 0 },
-        "total_payload_size_mb": { "type": "number", "minimum": 0 },
+        "total_payload_size_mb": { "type": "number", "minimum": 0 }
       }
     },
 
