@@ -98,12 +98,12 @@ class ContextExtractor {
         const stages = Array.isArray(pipeline?.stages) ? pipeline.stages : Array.isArray(job.stages) ? job.stages : [];
 
         const out = [];
-
+        
         for (let i = 0; i < stages.length; i++) {
             const stage = stages[i] || {};
             const flattened = {
                 job_id: jobId,
-                filesize,
+                filesize:(i===0)?filesize:null,
                 stage_id: stage.stage_id ?? stage.id ?? `idx-${i}`,
                 plugin_id: stage.plugin_id ?? stage.pluginId ?? null,
                 context: Array.isArray(stage.context) ? [...stage.context] : [],
