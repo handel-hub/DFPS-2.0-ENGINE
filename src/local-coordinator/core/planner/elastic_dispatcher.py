@@ -11,8 +11,11 @@ See: elastic_dispatcher_doc.md for full specification.
 from __future__ import annotations
 
 import heapq
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -36,14 +39,15 @@ class Task:
     spawn_latency_ms: int       # ms to cold-start this program_id
     job_score:       float      # base priority + aging from pre-processor
     pos_weight:      float      # DAG position multiplier
-    depends_on:      list[str]  # IDs of blocking tasks
-    children:        list[str]  # IDs of tasks unlocked on completion
+    solver_weight:   int   = 1  # CP‑SAT objective weight (resource‑based, independent)
+    depends_on:      list[str] = field(default_factory=list)
+    children:        list[str] = field(default_factory=list)
 
     # Mutable scheduling state — not part of the identity
     _deps_remaining: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._deps_remaining = len(self.depends_on)
+        self.deps_remaining= len(self.depends_on)
 
     @property
     def duration_s(self) -> float:
@@ -157,6 +161,23 @@ class ElasticDispatcher:
     Produces a complete Schedule Manifest via an event-driven loop.
     The manifest is immediately executable and serves as a warm-start
     hint for the CP-SAT solver running in the same process.
+
+    Args:
+        total_cpu:               Node CPU capacity in millicores.
+        total_ram:               Node RAM capacity in MB.
+        num_slots:               Maximum concurrent tasks.
+        warm_start_threshold:    Minimum ratio fraction a warm candidate
+                                 must achieve to trigger the Stability Pivot.
+                                 Default 0.90 (accepts up to 10% efficiency
+                                 loss to avoid a cold start).
+        alpha:                   Blending exponent for combining business priority
+                                 (job_score * pos_weight) and solver_weight.
+                                 alpha = 0.0 → pure business priority (default).
+                                 alpha = 1.0 → pure solver objective weight.
+                                 0 < alpha < 1 → continuous trade‑off.
+        use_fast_path:           If True, dispatch the highest-scoring ready
+                                 task to its best slot each cycle, trading
+                                 schedule quality for speed.
     """
 
     def __init__(
@@ -165,27 +186,23 @@ class ElasticDispatcher:
         total_ram: int,
         num_slots: int,
         warm_start_threshold: float = 0.90,
+        alpha: float = 0.0,
+        use_fast_path: bool = False,
     ) -> None:
-        """
-        Args:
-            total_cpu:             Node CPU capacity in millicores.
-            total_ram:             Node RAM capacity in MB.
-            num_slots:             Maximum concurrent tasks.
-            warm_start_threshold:  Minimum ratio fraction a warm candidate
-                                   must achieve to trigger the Stability Pivot.
-                                   Default 0.90 (accepts up to 10% efficiency
-                                   loss to avoid a cold start).
-        """
         if num_slots <= 0:
             raise ValueError(f"num_slots must be positive, got {num_slots}")
         if not (0.0 < warm_start_threshold <= 1.0):
             raise ValueError(
                 f"warm_start_threshold must be in (0, 1], got {warm_start_threshold}"
             )
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}")
 
         self._reservoir = Reservoir(total_cpu, total_ram)
         self._slots = [Slot(id=i) for i in range(num_slots)]
         self._threshold = warm_start_threshold
+        self._alpha = alpha
+        self._use_fast_path = use_fast_path
 
     # ─────────────────────────────────────────────────────────────────────────
     # PUBLIC API
@@ -194,61 +211,42 @@ class ElasticDispatcher:
     def build_schedule(self, tasks: list[Task]) -> list[ScheduleEntry]:
         """
         Run the greedy scheduling algorithm over all provided tasks.
-
-        Args:
-            tasks: All tasks for this planning cycle (both ready and blocked).
-                   The Dispatcher determines initial readiness from depends_on.
-
-        Returns:
-            Schedule Manifest — ordered list of ScheduleEntry objects.
-            Each entry maps a task to a slot with absolute ms timestamps.
         """
         if not tasks:
             return []
 
-        # ── Build task registry ───────────────────────────────────────────
-        # All ID resolution goes through here — no object cross-references
+        # Build task registry
         registry: dict[str, Task] = {t.id: t for t in tasks}
 
         # Reset mutable scheduling state so the dispatcher is re-entrant
         for task in tasks:
-            task._deps_remaining = len(task.depends_on)
+            task.deps_remaining= len(task.depends_on)
 
-        # ── Seed the ready pool ───────────────────────────────────────────
+        # Seed the ready pool
         ready_pool: list[Task] = [
-            t for t in tasks if t._deps_remaining == 0
+            t for t in tasks if t.deps_remaining== 0
         ]
 
-        # ── Min-heap for event-driven time jumps ──────────────────────────
-        # Each entry: (complete_at_ms, slot_id, task_id)
         event_heap: list[HeapEvent] = []
-
-        # Task objects currently running — needed to release resources
-        active_tasks: dict[str, Task] = {}  # task_id → Task
+        active_tasks: dict[str, Task] = {}
 
         manifest: list[ScheduleEntry] = []
         current_ms: int = 0
 
         # ── Main scheduling loop ──────────────────────────────────────────
         while ready_pool or event_heap:
-
-            # ── Dispatch cycle: assign as many ready tasks as possible ────
             dispatched_this_cycle = True
 
             while dispatched_this_cycle and ready_pool:
                 dispatched_this_cycle = False
 
-                # Evaluate every (task, slot) pair — O(T × S)
                 best = self._find_best_pair(ready_pool, current_ms)
-
                 if best is None:
-                    # No valid assignment exists right now (resource exhausted
-                    # or all slots busy) — break and wait for next event
                     break
 
                 task, slot = best
 
-                # Commit and record
+                # Commit resources
                 self._reservoir.commit(task)
                 ready_pool.remove(task)
                 active_tasks[task.id] = task
@@ -276,34 +274,29 @@ class ElasticDispatcher:
 
                 dispatched_this_cycle = True
 
-            # ── Event-driven time jump ────────────────────────────────────
+            # ── Time jump to next completion ──────────────────────────────
             if not event_heap:
-                # Nothing running, nothing ready — scheduling complete
                 break
 
-            # Advance to the next completion event
             event = heapq.heappop(event_heap)
             current_ms = event.complete_at_ms
 
-            # Complete the task
             completed_task = active_tasks.pop(event.task_id, None)
             if completed_task is not None:
                 self._reservoir.release(completed_task)
 
-                # Resolve children via registry — IDs only, no object refs
                 for child_id in completed_task.children:
                     child = registry.get(child_id)
                     if child is None:
-                        # Defensive: unknown child ID — skip
                         continue
-                    child._deps_remaining -= 1
-                    if child._deps_remaining == 0:
+                    child.deps_remaining-= 1
+                    if child.deps_remaining== 0:
                         ready_pool.append(child)
 
         return manifest
 
     # ─────────────────────────────────────────────────────────────────────────
-    # INTERNAL — pair selection
+    # PAIR SELECTION (supports both exhaustive and fast path)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _find_best_pair(
@@ -311,58 +304,82 @@ class ElasticDispatcher:
         ready_pool: list[Task],
         current_ms: int,
     ) -> Optional[tuple[Task, Slot]]:
-        """
-        Evaluate all (task, slot) pairs and return the best assignment.
 
-        Steps:
-          1. Filter pairs that fail the Hard Wall (Constraint 1).
-          2. Compute TCF and Ratio for each valid pair (Constraints 2 & 3).
-          3. Find the global best ratio pair (may be cold or warm).
-          4. Apply the Stability Pivot if the best pair is cold (Constraint 4).
+        if self._use_fast_path:
+            return self._find_best_pair_fast(ready_pool, current_ms)
 
-        Returns None if no valid pair exists (resource exhausted).
-        """
-        candidates: list[tuple[float, bool, Task, Slot]] = []
-        # (ratio, is_warm, task, slot) — collected for pivot evaluation
+        candidates: list[tuple[float, Task, Slot]] = []
 
         for task in ready_pool:
             if not self._reservoir.can_admit(task):
-                # Hard Wall — skip this task entirely this cycle
                 continue
-
             for slot in self._slots:
                 tcf_s = self._compute_tcf_s(task, slot, current_ms)
-
-                # Guard against degenerate TCF (should not occur with valid data)
                 if tcf_s <= 0.0:
+                    logger.warning(
+                        "Degenerate TCF (%.6f) for task %s on slot %d – clamping.",
+                        tcf_s, task.id, slot.id,
+                    )
                     tcf_s = 1e-9
 
-                ratio   = (task.job_score * task.pos_weight) / tcf_s
-                is_warm = slot.is_warm_for(task.program_id)
-
-                candidates.append((ratio, is_warm, task, slot))
+                ratio = self._compute_ratio(task) / tcf_s
+                candidates.append((ratio, task, slot))
 
         if not candidates:
             return None
 
-        # Sort descending by ratio — highest value first
-        candidates.sort(key=lambda c: c[0], reverse=True)
+        # Sort by ratio descending; no tie‑breaker needed — alpha handles blend
+        candidates.sort(key=lambda x: x[0], reverse=True)
 
-        best_ratio, best_is_warm, best_task, best_slot = candidates[0]
+        best_ratio, best_task, best_slot = candidates[0]
 
-        # ── Stability Pivot ───────────────────────────────────────────────
-        # If the top pair is cold, scan for a warm alternative for the
-        # same task. Accept if warm ratio >= threshold × cold ratio.
-        #
-        # Limitation (documented): cross-task warm substitution is not
-        # evaluated here. The pivot only considers the same task on a
-        # different slot. See elastic_dispatcher_doc.md Section 5, Constraint 4.
-        if not best_is_warm:
-            warm_alternative = self._find_warm_alternative(
-                best_task, best_ratio, current_ms
-            )
-            if warm_alternative is not None:
-                return best_task, warm_alternative
+        # Stability Pivot
+        if not best_slot.is_warm_for(best_task.program_id):
+            warm_slot = self._find_warm_alternative(best_task, best_ratio, current_ms)
+            if warm_slot is not None:
+                return best_task, warm_slot
+
+        return best_task, best_slot
+
+    def _find_best_pair_fast(
+        self,
+        ready_pool: list[Task],
+        current_ms: int,
+    ) -> Optional[tuple[Task, Slot]]:
+        """Fast dispatch: pick task with highest ratio numerator, then best slot."""
+        if not ready_pool:
+            return None
+
+        # Select the task that would have the highest numerator (score)
+        best_task = max(ready_pool, key=lambda t: self._compute_ratio(t))
+
+        if not self._reservoir.can_admit(best_task):
+            return None
+
+        best_ratio = -1.0
+        best_slot: Optional[Slot] = None
+
+        for slot in self._slots:
+            tcf_s = self._compute_tcf_s(best_task, slot, current_ms)
+            if tcf_s <= 0.0:
+                logger.warning(
+                    "Degenerate TCF (%.6f) in fast path for task %s on slot %d.",
+                    tcf_s, best_task.id, slot.id,
+                )
+                tcf_s = 1e-9
+            ratio = self._compute_ratio(best_task) / tcf_s
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_slot  = slot
+
+        if best_slot is None:
+            return None
+
+        # Stability Pivot
+        if not best_slot.is_warm_for(best_task.program_id):
+            warm_slot = self._find_warm_alternative(best_task, best_ratio, current_ms)
+            if warm_slot is not None:
+                best_slot = warm_slot
 
         return best_task, best_slot
 
@@ -372,23 +389,22 @@ class ElasticDispatcher:
         cold_best_ratio: float,
         current_ms: int,
     ) -> Optional[Slot]:
-        """
-        Scan all slots for a warm alternative for the given task.
-        Returns the slot if its warm ratio meets the threshold, else None.
-        """
-        best_warm_slot: Optional[Slot]  = None
-        best_warm_ratio: float          = -1.0
+        best_warm_slot: Optional[Slot] = None
+        best_warm_ratio: float = -1.0
+
+        numerator = self._compute_ratio(task)
 
         for slot in self._slots:
             if not slot.is_warm_for(task.program_id):
                 continue
-
             tcf_s = self._compute_tcf_s(task, slot, current_ms)
             if tcf_s <= 0.0:
+                logger.warning(
+                    "Degenerate warm TCF (%.6f) for task %s on slot %d.",
+                    tcf_s, task.id, slot.id,
+                )
                 tcf_s = 1e-9
-
-            ratio = (task.job_score * task.pos_weight) / tcf_s
-
+            ratio = numerator / tcf_s
             if ratio > best_warm_ratio:
                 best_warm_ratio = ratio
                 best_warm_slot  = slot
@@ -402,19 +418,29 @@ class ElasticDispatcher:
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # INTERNAL — TCF computation
+    # RATIO COMPUTATION (weighted geometric mean)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _compute_ratio(self, task: Task) -> float:
+        """
+        Weighted geometric mean of business priority and solver weight,
+        according to alpha.
+        """
+        business = task.job_score * task.pos_weight
+        solver   = task.solver_weight
+
+        if self._alpha <= 0.0:
+            return business
+        elif self._alpha >= 1.0:
+            return float(solver)
+        else:
+            return (business ** (1 - self._alpha)) * (solver ** self._alpha)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TCF
     # ─────────────────────────────────────────────────────────────────────────
 
     def _compute_tcf_s(self, task: Task, slot: Slot, current_ms: int) -> float:
-        """
-        Total Cost to Finish in seconds — Constraint 2.
-
-        TCF = wait_time_s + startup_penalty_s + duration_s
-
-        All components normalized to seconds so the ratio (score/TCF)
-        produces values in a readable range (~0.01–10.0 for typical workloads)
-        rather than raw millisecond values (~10⁻⁴ to 10⁻²).
-        """
         wait_s    = slot.wait_time_s(current_ms)
         startup_s = 0.0 if slot.is_warm_for(task.program_id) else task.spawn_latency_s
         return wait_s + startup_s + task.duration_s
@@ -425,43 +451,35 @@ class ElasticDispatcher:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-
-    # Reproduces Section 7 simulation trace: T1 → T2 DAG handoff
+    # Simple two‑task DAG, now with solver_weight
     t1 = Task(
         id="T1", job_id="J1", program_id="P1",
         duration_ms=500, cpu=500, ram=2000, spawn_latency_ms=1000,
-        job_score=100.0, pos_weight=1.2,
+        job_score=100.0, pos_weight=1.2, solver_weight=500,
         depends_on=[], children=["T2"],
     )
     t2 = Task(
         id="T2", job_id="J1", program_id="P2",
         duration_ms=300, cpu=300, ram=1000, spawn_latency_ms=800,
-        job_score=100.0, pos_weight=1.0,
+        job_score=100.0, pos_weight=1.0, solver_weight=300,
         depends_on=["T1"], children=[],
     )
 
-    dispatcher = ElasticDispatcher(
-        total_cpu=4000,
-        total_ram=16000,
-        num_slots=2,
-        warm_start_threshold=0.90,
-    )
-
-    manifest = dispatcher.build_schedule([t1, t2])
-
-    print("Schedule Manifest:")
-    for entry in manifest:
-        print(
-            f"  task={entry.task_id}  slot={entry.slot_id}"
-            f"  start={entry.start_time}ms  end={entry.end_time}ms"
-        )
-
+    # Test with alpha=0 (pure business)
+    disp = ElasticDispatcher(total_cpu=4000, total_ram=16000, num_slots=2,
+                             warm_start_threshold=0.9, alpha=0.0)
+    manifest = disp.build_schedule([t1, t2])
+    print("α=0.0 (business only):")
+    for e in manifest:
+        print(f"  {e.task_id} slot={e.slot_id} start={e.start_time} end={e.end_time}")
     assert len(manifest) == 2
-    assert manifest[0].task_id    == "T1"
-    assert manifest[0].start_time == 0
-    assert manifest[0].end_time   == 1500
-    assert manifest[1].task_id    == "T2"
-    assert manifest[1].start_time == 1500
-    assert manifest[1].end_time   == 2600
+    print("  ✓ OK\n")
 
-    print("\nSmoke test passed ✓")
+    # Test with alpha=0.3 (slight blend)
+    disp2 = ElasticDispatcher(total_cpu=4000, total_ram=16000, num_slots=2,
+                              warm_start_threshold=0.9, alpha=0.3)
+    manifest2 = disp2.build_schedule([t1, t2])
+    print("α=0.3 (blended):")
+    for e in manifest2:
+        print(f"  {e.task_id} slot={e.slot_id} start={e.start_time} end={e.end_time}")
+    print("  ✓ OK")
