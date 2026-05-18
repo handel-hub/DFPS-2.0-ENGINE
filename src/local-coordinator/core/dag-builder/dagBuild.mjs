@@ -1,74 +1,58 @@
 // dagBuilder.mjs
 'use strict';
 
-/**
- * ES Module DAG Builder
- *
- * Produces Task objects compatible with the Python Task dataclass in elastic_dispatcher.py.
- *
- * Profile store duck-typing:
- *   timeProfiles.getTimeProfile(pipelineId, pluginId, extension, fileSizeMB)
- *   cpuProfiles.getCpuProfile(pluginId, extension)
- *   memProfiles.estimateRequiredMB(pipelineId, extension, fileSizeBytes)
- *
- * Exports:
- *   - default: DAGBuilder
- *   - named: DAGValidationError, CostingError, NodeConfig
- */
+import Ajv from 'ajv';
+import jobSchema from '../schemas/job.schema.json' assert { type: 'json' };
+import fullContextSchema from '../schemas/fullContext.schema.json' assert { type: 'json' };
+import { computeSolverWeight } from './weightUtils.mjs';
 
-/* Constants (mirror Python build.txt) */
-const POS_WEIGHT_MAX = 1.30;
-const POS_WEIGHT_MIN = 0.70;
-const RESERVOIR_SAFETY = 0.90;
-
-const MIN_DURATION_MS = 50;
-const MIN_CPU_MILLICORES = 10;
-const MIN_RAM_MB = 10;
-const MIN_SPAWN_MS = 0;
+const ajv = new Ajv({ allErrors: true, useDefaults: true, strict: false });
+const validateJob = ajv.compile(jobSchema);
+const validateFullContext = ajv.compile(fullContextSchema);
 
 /* Errors */
 export class DAGValidationError extends Error {
     constructor(message) {
-        super(message);
-        this.name = 'DAGValidationError';
+        super(message); this.name = 'DAGValidationError'; 
     }
 }
-
-export class CostingError extends Error {
-    constructor(message, taskId, field, value) {
-        super(message);
-        this.name = 'CostingError';
-        this.taskId = taskId;
-        this.field = field;
-        this.value = value;
-    }
+export class SchemaError extends Error { 
+    constructor(message, details = null) { 
+        super(message); this.name = 'SchemaError'; this.details = details; 
+    } 
+}
+export class MissingContextError extends Error { 
+    constructor(jobId, stageId) { 
+        super(`Missing fullContext for ${jobId}::${stageId}`); 
+        this.name = 'MissingContextError'; this.jobId = jobId; 
+        this.stageId = stageId; 
+    } 
+}
+export class CostingError extends Error { 
+    constructor(message, taskId, field, value) { 
+        super(message); this.name = 'CostingError'; 
+        this.taskId = taskId; this.field = field; 
+        this.value = value; 
+    } 
 }
 
-/* NodeConfig helper */
+/* NodeConfig */
 export class NodeConfig {
     constructor({ total_cpu_millicores, total_ram_mb }) {
         if (!Number.isInteger(total_cpu_millicores) || !Number.isInteger(total_ram_mb)) {
-            throw new TypeError('NodeConfig expects integer total_cpu_millicores and total_ram_mb');
+        throw new TypeError(`NodeConfig expects integer total_cpu_millicores and total_ram_mb, but received total_cpu_millicores=${total_cpu_millicores}, total_ram_mb=${total_ram_mb}`);
         }
         this.total_cpu_millicores = total_cpu_millicores;
         this.total_ram_mb = total_ram_mb;
     }
-
-    get safe_cpu() {
-        return Math.floor(this.total_cpu_millicores * RESERVOIR_SAFETY);
-    }
-
-    get safe_ram() {
-        return Math.floor(this.total_ram_mb * RESERVOIR_SAFETY);
-    }
+    
+    get safe_cpu() { return Math.floor(this.total_cpu_millicores * 0.9); }
+    get safe_ram() { return Math.floor(this.total_ram_mb * 0.9); }
 }
 
-/* Internal _TaskNode representation (not exported) */
-    class _TaskNode {
-    constructor({
-        taskId, jobId, pluginId, pipelineId, fileType, sizeBytes, jobScore,
-        dependsOn = [], children = [], depth = 0, maxDepth = 0
-    }) {
+/* Internal Task Node */
+class TaskNode {
+    constructor({ taskId, jobId, pluginId, pipelineId, fileType, sizeBytes, jobScore, dependsOn = [], children = [], depth = 0, maxDepth = 0, ctxEntry = null }) {
         this.taskId = taskId;
         this.jobId = jobId;
         this.pluginId = pluginId;
@@ -80,385 +64,252 @@ export class NodeConfig {
         this.children = children;
         this.depth = depth;
         this.maxDepth = maxDepth;
+        this.ctxEntry = ctxEntry;
     }
-    }
+}
 
+/* DAGBuilder */
 export default class DAGBuilder {
-    #POS_WEIGHT_MAX;
-    #POS_WEIGHT_MIN;
-    #MIN_DURATION_MS;
-    #MIN_CPU_MILLICORES;
-    #MIN_RAM_MB;
-    #MIN_SPAWN_MS;
-
-    constructor(options = {}) {
-        // allow overriding constants for testing
-        this.#POS_WEIGHT_MAX = options.POS_WEIGHT_MAX ?? POS_WEIGHT_MAX;
-        this.#POS_WEIGHT_MIN = options.POS_WEIGHT_MIN ?? POS_WEIGHT_MIN;
-        this.#MIN_DURATION_MS = options.MIN_DURATION_MS ?? MIN_DURATION_MS;
-        this.#MIN_CPU_MILLICORES = options.MIN_CPU_MILLICORES ?? MIN_CPU_MILLICORES;
-        this.#MIN_RAM_MB = options.MIN_RAM_MB ?? MIN_RAM_MB;
-        this.#MIN_SPAWN_MS = options.MIN_SPAWN_MS ?? MIN_SPAWN_MS;
+    constructor({ strict = true, weightConfig = {} } = {}) {
+        this.strict = strict;
+        this.weightConfig = Object.assign({
+        bias: 0.5, cpuWeight: 2.0, memWeight: 1.2, timeWeight: 1.4,
+        scaleToInt: 1000, minInt: 1, maxInt: 20000,
+        defaultConfidence: 0.5, memLogOffset: 1.0, timeLogOffset: 1.0
+        }, weightConfig);
     }
-
-  /* -------------------- Public API -------------------- */
 
     /**
-     * buildBatch(jobs, nodeConfig, timeProfiles, cpuProfiles, memProfiles)
-     * Returns an array of Task-like plain objects compatible with Python Task dataclass.
+     * Builds a batch of DAG tasks from job definitions, node configuration, and full context entries.
+     * 
+     * @param {Array<Object>} jobs - Array of job objects to process.
+     * @param {NodeConfig} nodeConfig - Node configuration specifying available resources.
+     * @param {Array<Object>} fullContext - Array of context entries providing runtime and resource info for each job stage.
+     * @returns {Array<Object>} Array of task objects ready for scheduling, each with resource requirements and dependencies.
+     * @throws {TypeError} If input types are invalid.
+     * @throws {SchemaError} If job or context schema validation fails.
+     * @throws {MissingContextError} If a required context entry is missing.
+     * @throws {DAGValidationError} If the resulting DAG is invalid (e.g., missing dependencies).
+     * @throws {CostingError} If resource requirements exceed node capabilities.
      */
-    buildBatch(jobs, nodeConfig, timeProfiles = null, cpuProfiles = null, memProfiles = null) {
+    buildBatch(jobs, nodeConfig, fullContext) {
+        // Validate inputs
+        if (!Array.isArray(jobs)) throw new TypeError('jobs must be an array');
+        if (!(nodeConfig instanceof NodeConfig)) throw new TypeError('nodeConfig must be NodeConfig');
+        if (!Array.isArray(fullContext)) throw new TypeError('fullContext must be an array');
 
-        if (!nodeConfig || typeof nodeConfig.safe_cpu !== 'number' || typeof nodeConfig.safe_ram !== 'number') {
-            throw new TypeError('nodeConfig must provide safe_cpu and safe_ram numeric properties (use NodeConfig).');
+        // Validate schemas
+        for (const j of jobs) {
+        if (!validateJob(j)) throw new SchemaError('Job schema validation failed', validateJob.errors);
+        }
+        for (const f of fullContext) {
+        if (!validateFullContext(f)) throw new SchemaError('fullContext entry schema validation failed', validateFullContext.errors);
         }
 
-        if (!Array.isArray(jobs) || jobs.length === 0) return [];
+        // Build ctxMap
+        const ctxMap = new Map();
+        for (const f of fullContext) {
+        const key = `${f.job_id}::${f.stage_id}`;
+        if (ctxMap.has(key)) throw new SchemaError(`Duplicate fullContext entry for ${key}`);
+        ctxMap.set(key, f);
+        }
 
-        // Phase 1: collect all task ids and validate uniqueness across batch
-        const allTaskIds = new Set();
+        // Validate job-stage coverage
         for (const job of jobs) {
-            if (!Array.isArray(job.stages)) continue;
-            for (const stage of job.stages) {
-                const tid = this.#taskId(job.job_id, stage.stage_id);
-                if (allTaskIds.has(tid)) {
-                    throw new DAGValidationError(`Task ID collision: '${tid}' appears in multiple jobs. Ensure job_id values are unique across the batch.`);
-                }
-                allTaskIds.add(tid);
+        const stages = job.pipeline?.stages ?? [];
+        if (!Array.isArray(stages) || stages.length === 0) throw new SchemaError(`Job ${job.job_id} missing pipeline.stages`);
+        for (const s of stages) {
+            const key = `${job.job_id}::${s.stage_id}`;
+            if (!ctxMap.has(key)) {
+            if (this.strict) throw new MissingContextError(job.job_id, s.stage_id);
+            else throw new SchemaError(`Missing fullContext for ${key}`);
             }
         }
+        }
 
-        // Build per-job graphs
+        // Build nodes
         const allNodes = [];
         for (const job of jobs) {
-            const nodes = this.#buildGraph(job);
-            allNodes.push(...nodes);
+        const nodes = this.#buildGraphForJob(job, ctxMap);
+        allNodes.push(...nodes);
         }
 
-        // Phase 2: costing
+        // Cost nodes and produce tasks
         const tasks = [];
         for (const node of allNodes) {
-            const clusterProfile = this.#getClusterProfile(jobs, node.jobId, node.pluginId);
-            const task = this.#costNode(node, nodeConfig, clusterProfile, timeProfiles, cpuProfiles, memProfiles);
-            tasks.push(task);
+        const task = this.#costNode(node, nodeConfig);
+        tasks.push(task);
         }
 
-        // Final validation: ensure depends_on references exist in produced tasks
-        const producedIds = new Set(tasks.map(t => t.id));
+        // Final validation: depends_on exist
+        const produced = new Set(tasks.map(t => t.id));
         for (const t of tasks) {
-            for (const dep of t.depends_on) {
-                if (!producedIds.has(dep)) {
-                throw new DAGValidationError(`Task '${t.id}' depends_on '${dep}' which does not exist in the batch.`);
-                }
-            }
+        for (const d of t.depends_on) {
+            if (!produced.has(d)) throw new DAGValidationError(`Task ${t.id} depends_on ${d} which is not present`);
         }
+        }
+
+        // Deterministic ordering
+        tasks.sort((a, b) => {
+        if (a.job_id < b.job_id) return -1;
+        if (a.job_id > b.job_id) return 1;
+        if (a.id < b.id) return -1;
+        if (a.id > b.id) return 1;
+        return 0;
+        });
 
         return tasks;
     }
 
-  /* -------------------- Private helpers (use #) -------------------- */
-
-    #taskId(jobId, stageId) {
-        return `${jobId}::${stageId}`;
-    }
-
-    #buildGraph(job) {
-        if (!Array.isArray(job.stages) || job.stages.length === 0) return [];
-
-        // stage -> task id
+    #buildGraphForJob(job, ctxMap) {
+        const stages = job.pipeline.stages;
         const stageToTask = {};
-        for (const stage of job.stages) {
-            stageToTask[stage.stage_id] = this.#taskId(job.job_id, stage.stage_id);
+        for (const s of stages) stageToTask[s.stage_id] = `${job.job_id}::${s.stage_id}`;
+
+        // validate depends_on
+        for (const s of stages) {
+        for (const d of s.depends_on || []) {
+            if (!stageToTask[d]) throw new DAGValidationError(`Job ${job.job_id}: stage ${s.stage_id} depends on unknown ${d}`);
+        }
         }
 
-        // validate depends_on references
-        for (const stage of job.stages) {
-            for (const dep of stage.depends_on || []) {
-                if (!stageToTask[dep]) {
-                    throw new DAGValidationError(`Job '${job.job_id}': stage '${stage.stage_id}' depends on unknown stage '${dep}'.`);
-                }
-            }
-        }
-
-        // build adjacency
+        // adjacency
         const childrenMap = new Map();
         const taskDepends = {};
-        for (const stage of job.stages) {
-            const tid = stageToTask[stage.stage_id];
-            const depTaskIds = (stage.depends_on || []).map(d => stageToTask[d]);
-            taskDepends[tid] = depTaskIds;
-            for (const depTid of depTaskIds) {
-                const arr = childrenMap.get(depTid) || [];
-                arr.push(tid);
-                childrenMap.set(depTid, arr);
-            }
+        for (const s of stages) {
+        const tid = stageToTask[s.stage_id];
+        const deps = (s.depends_on || []).map(d => stageToTask[d]);
+        taskDepends[tid] = deps;
+        for (const dep of deps) {
+            const arr = childrenMap.get(dep) || [];
+            arr.push(tid);
+            childrenMap.set(dep, arr);
+        }
         }
 
-        // compute depths (Kahn's algorithm)
+        // depths
         const depths = this.#computeDepths(taskDepends, job.job_id);
         const maxDepth = Object.keys(depths).length ? Math.max(...Object.values(depths)) : 0;
 
-        // build _TaskNode list
+        // nodes
         const nodes = [];
-        for (const stage of job.stages) {
-        const tid = stageToTask[stage.stage_id];
-        nodes.push(new _TaskNode({
-            taskId: tid,
-            jobId: job.job_id,
-            pluginId: stage.plugin_id,
-            pipelineId: job.pipeline_id,
-            fileType: job.file_type,
-            sizeBytes: job.size_bytes,
-            jobScore: job.calculated_score,
-            dependsOn: taskDepends[tid] || [],
-            children: childrenMap.get(tid) || [],
-            depth: depths[tid] ?? 0,
-            maxDepth
+        for (const s of stages) {
+        const tid = stageToTask[s.stage_id];
+        const ctx = ctxMap.get(tid);
+        const sizeBytes = Number(ctx.S_hat ?? ctx.filesize ?? 0);
+        const fileType = ctx.extension ?? null;
+        const pipelineId = job.pipeline_id ?? job.pipeline?.id ?? null;
+        const jobScore = Number(job.calculatedScore ?? job.calculated_score ?? 0);
+        nodes.push(new TaskNode({
+            taskId: tid, jobId: job.job_id, pluginId: s.plugin_id, pipelineId,
+            fileType, sizeBytes, jobScore, dependsOn: taskDepends[tid] || [], children: childrenMap.get(tid) || [],
+            depth: depths[tid] ?? 0, maxDepth, ctxEntry: ctx
         }));
         }
-
         return nodes;
     }
 
     #computeDepths(taskDepends, jobId) {
-        // in-degree
         const inDegree = {};
         const childrenOf = {};
-        for (const tid of Object.keys(taskDepends)) {
-            inDegree[tid] = (taskDepends[tid] || []).length;
-        }
+        for (const tid of Object.keys(taskDepends)) inDegree[tid] = (taskDepends[tid] || []).length;
         for (const [tid, deps] of Object.entries(taskDepends)) {
-            for (const dep of deps) {
-                const arr = childrenOf[dep] || [];
-                arr.push(tid);
-                childrenOf[dep] = arr;
-            }
+        for (const d of deps) {
+            const arr = childrenOf[d] || [];
+            arr.push(tid);
+            childrenOf[d] = arr;
         }
-
-        // queue seed
+        }
         const queue = [];
-        for (const [tid, deg] of Object.entries(inDegree)) {
-            if (deg === 0) queue.push(tid);
-        }
-
+        for (const [tid, deg] of Object.entries(inDegree)) if (deg === 0) queue.push(tid);
         const depths = {};
-        for (const tid of queue) depths[tid] = 0;
-
+        for (const t of queue) depths[t] = 0;
         let processed = 0;
-        while (queue.length > 0) {
-            const tid = queue.shift();
-            processed += 1;
-            const currentDepth = depths[tid] || 0;
-            const children = childrenOf[tid] || [];
-            for (const child of children) {
-                inDegree[child] -= 1;
-                depths[child] = Math.max(depths[child] || 0, currentDepth + 1);
-                if (inDegree[child] === 0) queue.push(child);
-            }
+        while (queue.length) {
+        const t = queue.shift(); processed++;
+        const cur = depths[t] || 0;
+        const children = childrenOf[t] || [];
+        for (const c of children) {
+            inDegree[c] -= 1;
+            depths[c] = Math.max(depths[c] || 0, cur + 1);
+            if (inDegree[c] === 0) queue.push(c);
         }
-
-        if (processed !== Object.keys(taskDepends).length) {
-            throw new DAGValidationError(`Job '${jobId}': cycle detected in stage dependency graph. Processed ${processed}/${Object.keys(taskDepends).length} stages before deadlock.`);
         }
-
+        if (processed !== Object.keys(taskDepends).length) throw new DAGValidationError(`Cycle detected in job ${jobId}`);
         return depths;
     }
 
-    #getClusterProfile(jobs, jobId, pluginId) {
-        const job = jobs.find(j => j.job_id === jobId);
-        if (!job) return {};
-        const cp = job.cluster_profile || {};
-        return cp[pluginId] || {};
-    }
-
-    #computePosWeight(depth, maxDepth) {
-        if (maxDepth <= 0) return this.#POS_WEIGHT_MAX;
-        const t = depth / maxDepth;
-        return this.#POS_WEIGHT_MAX * (1 - t) + this.#POS_WEIGHT_MIN * t;
-    }
-
-    #costNode(node, nodeConfig, clusterProfile = {}, timeProfiles = null, cpuProfiles = null, memProfiles = null) {
-        const fileSizeMB = Math.max(1.0, node.sizeBytes / (1024 * 1024));
-
-        const durationMs = this.#resolveDuration(node, fileSizeMB, clusterProfile, timeProfiles);
-        const spawnLatencyMs = this.#resolveSpawn(node, clusterProfile, timeProfiles);
-        const cpuMillicores = this.#resolveCpu(node, fileSizeMB, clusterProfile, cpuProfiles);
-        const ramMb = this.#resolveRam(node, fileSizeMB, clusterProfile, memProfiles);
-
-        // feasibility checks
-        if (cpuMillicores > nodeConfig.safe_cpu) {
-            throw new CostingError(
-                `Task '${node.taskId}' requires ${cpuMillicores} millicores but node safe CPU capacity is ${nodeConfig.safe_cpu}mc. This task will never be scheduled.`,
-                node.taskId, 'cpu', cpuMillicores
-            );
-        }
-        if (ramMb > nodeConfig.safe_ram) {
-            throw new CostingError(
-                `Task '${node.taskId}' requires ${ramMb}MB RAM but node safe RAM capacity is ${nodeConfig.safe_ram}MB. This task will never be scheduled.`,
-                node.taskId, 'ram', ramMb
-            );
+    #costNode(node, nodeConfig) {
+        const ctx = node.ctxEntry;
+        // Validate required ctx fields
+        const required = ['duration_ms', 'memoryBytes'];
+        for (const r of required) {
+        if (!Object.prototype.hasOwnProperty.call(ctx, r)) throw new SchemaError(`fullContext missing ${r} for ${node.taskId}`);
         }
 
+        // Duration
+        const durationMs = Math.max(1, Math.floor(Number(ctx.duration_ms)));
+
+        // CPU: accept numeric millicores or object {avgCpu, confidence}
+        let cpuMc = null;
+        if (typeof ctx.cpu === 'number') cpuMc = Math.max(1, Math.floor(ctx.cpu));
+        else if (ctx.cpu && typeof ctx.cpu === 'object' && Number.isFinite(Number(ctx.cpu.avgCpu))) {
+        const avg = Number(ctx.cpu.avgCpu);
+        const clusterCpu = nodeConfig.safe_cpu || 1000;
+        cpuMc = Math.max(1, Math.floor(clusterCpu * Math.max(0.01, avg)));
+        } else {
+        throw new SchemaError(`fullContext.cpu missing or invalid for ${node.taskId}`);
+        }
+
+        // RAM
+        let ramMb = null;
+        if (Number.isFinite(Number(ctx.memoryBytes))) ramMb = Math.max(1, Math.ceil(Number(ctx.memoryBytes) / (1024 * 1024)));
+        else if (Number.isFinite(Number(ctx.memMB))) ramMb = Math.max(1, Math.ceil(Number(ctx.memMB)));
+        else throw new SchemaError(`fullContext.memoryBytes/memMB missing for ${node.taskId}`);
+
+        // Spawn latency
+        const spawnMs = Number.isFinite(Number(ctx.spawn_latency_ms)) ? Math.max(0, Math.floor(Number(ctx.spawn_latency_ms))) : 0;
+
+        // Feasibility checks
+        if (cpuMc > nodeConfig.safe_cpu) throw new CostingError(`cpu requirement ${cpuMc} > node safe_cpu ${nodeConfig.safe_cpu}`, node.taskId, 'cpu', cpuMc);
+        if (ramMb > nodeConfig.safe_ram) throw new CostingError(`ram requirement ${ramMb} > node safe_ram ${nodeConfig.safe_ram}`, node.taskId, 'ram', ramMb);
+
+        // pos_weight
         const posWeight = this.#computePosWeight(node.depth, node.maxDepth);
 
-        // Build Task object compatible with Python Task dataclass
+        // solver_weight
+        const cpuProfile = (typeof ctx.cpu === 'object') ? ctx.cpu : { avgCpu: Math.min(1, cpuMc / 4000), confidence: this.weightConfig.defaultConfidence };
+        const memBytes = Number(ctx.memoryBytes);
+        const durMs = durationMs;
+        const solverWeight = computeSolverWeight({ cpuProfile, memoryBytes: memBytes, durationMs: durMs, config: this.weightConfig });
+
+        // Build task
         return {
-            id: node.taskId,
-            job_id: node.jobId,
-            program_id: node.pluginId,
-            duration_ms: durationMs,
-            cpu: cpuMillicores,
-            ram: ramMb,
-            spawn_latency_ms: spawnLatencyMs,
-            job_score: node.jobScore,
-            pos_weight: posWeight,
-            depends_on: [...node.dependsOn],
-            children: [...node.children]
+        id: node.taskId,
+        job_id: node.jobId,
+        program_id: node.pluginId,
+        duration_ms: durationMs,
+        cpu: cpuMc,
+        ram: ramMb,
+        spawn_latency_ms: spawnMs,
+        job_score: node.jobScore,
+        pos_weight: posWeight,
+        solver_weight: solverWeight,
+        depends_on: [...node.dependsOn],
+        children: [...node.children],
+        diagnostics: {
+            source: ctx.source ?? 'fullContext',
+            schemaVersion: ctx.schemaVersion ?? null,
+            cpuProfile: ctx.cpu ?? null,
+            memMB: ramMb,
+            duration_ms: durationMs
+        }
         };
     }
 
-    #toNumberSafe(v, fallback = 0) {
-        const n = Number(v);
-        return Number.isFinite(n) ? n : fallback;
-    }
-
-    #resolveDuration(node, fileSizeMB, clusterProfile, timeProfiles) {
-        const clusterMs = this.#toNumberSafe(clusterProfile?.duration_ms, 0);
-        let localMs = 0;
-
-        if (timeProfiles) {
-            try {
-                const profile = timeProfiles.getTimeProfile(node.pipelineId, node.pluginId, node.fileType, fileSizeMB);
-                localMs = this.#toNumberSafe(profile?.duration_ms, 0);
-            } catch (e) {
-                localMs = 0;
-            }
-        }
-
-        let durationMs;
-        if (localMs > 0 && clusterMs > 0) {
-            const deviation = Math.abs(localMs - clusterMs) / Math.max(clusterMs, 1);
-            durationMs = deviation > 0.30 ? Math.max(localMs, clusterMs) : localMs;
-        } else if (localMs > 0) {
-            durationMs = localMs;
-        } else if (clusterMs > 0) {
-            durationMs = clusterMs;
-        } else {
-            durationMs = Math.max(this.#MIN_DURATION_MS, Math.floor(fileSizeMB * 500));
-        }
-
-        return Math.max(this.#MIN_DURATION_MS, durationMs);
-    }
-
-    #resolveSpawn(node, clusterProfile, timeProfiles) {
-        const clusterSpawn =this.#toNumberSafe(clusterProfile.spawn_latency_ms, 0);
-        let localSpawn = 0;
-
-        if (timeProfiles) {
-            try {
-                const profile = timeProfiles.getTimeProfile(node.pipelineId, node.pluginId, node.fileType, 1.0);
-                const spawnData = profile?.spawn || {};
-                const sampleCount = spawnData?.sampleCount || 0;
-                if (sampleCount > 0) localSpawn = parseInt(spawnData.latency_ms || 0, 10) || 0;
-            } catch (e) {
-                localSpawn = 0;
-            }
-        }
-
-        let spawnMs;
-        if (localSpawn > 0 && clusterSpawn > 0) {
-            const deviation = Math.abs(localSpawn - clusterSpawn) / Math.max(clusterSpawn, 1);
-            spawnMs = deviation > 0.30 ? Math.max(localSpawn, clusterSpawn) : localSpawn;
-        } else if (localSpawn > 0) {
-            spawnMs = localSpawn;
-        } else if (clusterSpawn > 0) {
-            spawnMs = clusterSpawn;
-        } else {
-            spawnMs = 1000;
-        }
-
-        return Math.max(this.#MIN_SPAWN_MS, spawnMs);
-    }
-
-    #resolveCpu(node, fileSizeMB, clusterProfile, cpuProfiles) {
-        const clusterCpu = this.#toNumberSafe(clusterProfile.cpu_millicores, 0);
-        let localCpu = 0;
-
-        if (cpuProfiles) {
-            try {
-                const signal = cpuProfiles.getCpuProfile(node.pluginId, node.fileType) || {};
-                const peakNorm = Number(signal.peakCpu || 0.0);
-                const sampleCount = Number(signal.sampleCount || 0);
-                if (peakNorm > 0 && sampleCount > 0) {
-                    const avg = Number(signal.avgCpu || peakNorm);
-                    if (clusterCpu > 0 && avg > 0) {
-                        const peakRatio = peakNorm / avg;
-                        localCpu = Math.floor(clusterCpu * Math.min(peakRatio, 3.0));
-                    } else {
-                        localCpu = Math.floor(peakNorm * 4000);
-                    }
-                }
-            } catch (e) {
-                localCpu = 0;
-            }
-        }
-
-        // fallback scaling approach (mirrors Python second branch)
-        if (cpuProfiles && clusterCpu > 0) {
-        try {
-            const signal = cpuProfiles.getCpuProfile(node.pluginId, node.fileType) || {};
-            if ((signal.sampleCount || 0) > 0) {
-                const avg = Number(signal.avgCpu || 0.35);
-                const peak = Number(signal.peakCpu || avg);
-                if (avg > 0) {
-                    const peakRatio = peak / avg;
-                    localCpu = Math.floor(clusterCpu * Math.min(peakRatio, 3.0));
-                }
-            }
-        } catch (e) {
-            // ignore
-        }
-        }
-
-        let cpuMc;
-        if (localCpu > 0 && clusterCpu > 0) {
-            const deviation = Math.abs(localCpu - clusterCpu) / Math.max(clusterCpu, 1);
-            cpuMc = deviation > 0.30 ? Math.max(localCpu, clusterCpu) : localCpu;
-        } else if (localCpu > 0) {
-            cpuMc = localCpu;
-        } else if (clusterCpu > 0) {
-            cpuMc = clusterCpu;
-        } else {
-            cpuMc = 500;
-        }
-
-        return Math.max(this.#MIN_CPU_MILLICORES, cpuMc);
-    }
-
-    #resolveRam(node, fileSizeMB, clusterProfile, memProfiles) {
-        const clusterRam = this.#toNumberSafe(clusterProfile.ram_mb , 0);
-        let localRam = 0;
-
-        if (memProfiles) {
-            try {
-                localRam = this.#toNumberSafe(memProfiles.estimateRequiredMB(node.pipelineId, node.fileType, node.sizeBytes), 0);
-            } catch (e) {
-                localRam = 0;
-            }
-        }
-
-        let ramMb;
-        if (localRam > 0 && clusterRam > 0) {
-            const deviation = Math.abs(localRam - clusterRam) / Math.max(clusterRam, 1);
-            ramMb = deviation > 0.30 ? Math.max(localRam, clusterRam) : localRam;
-        } else if (localRam > 0) {
-            ramMb = localRam;
-        } else if (clusterRam > 0) {
-            ramMb = clusterRam;
-        } else {
-            ramMb = Math.ceil(Math.max(2 * fileSizeMB, this.#MIN_RAM_MB));
-        }
-
-        return Math.max(this.#MIN_RAM_MB, ramMb);
+    #computePosWeight(depth, maxDepth) {
+        if (maxDepth <= 0) return 1.0;
+        const t = depth / maxDepth;
+        return this.weightConfig.posWeightMax ?? (1.3 * (1 - t) + 0.7 * t);
     }
 }
