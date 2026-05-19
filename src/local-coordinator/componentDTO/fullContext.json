@@ -20,12 +20,7 @@
 					"required": ["stage_id", "plugin_id"],
 					"properties": {
 					"stage_id": { "type": "string", "minLength": 1 },
-					"plugin_id": { "type": "string", "minLength": 1 },
-					"depends_on": {
-						"type": "array",
-						"items": { "type": "string" },
-						"default": []
-					}
+					"plugin_id": { "type": "string", "minLength": 1 }
 					},
 					"additionalProperties": true
 				},

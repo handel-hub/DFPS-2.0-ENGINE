@@ -13,18 +13,18 @@
           "minItems": 1,
           "items": {
             "type": "object",
-            "required": ["stage_id", "plugin_id"],
+            "required": ["stageId", "pluginId"],
             "properties": {
-              "stage_id": { "type": "string" },
-              "plugin_id": { "type": "string" },
-              "depends_on": { "type": "array", "items": { "type": "string" }, "default": [] },
-              "metadata": { "type": "object", "additionalProperties": true }
+              "stageId": { "type": "string" },
+              "pluginId": { "type": "string" },
+              "depends_on": { 
+                "type": "array", 
+                "items": { "type": "string" }
+              }
             }
           }
         }
       }
-    },
-    "meta": { "type": "object", "additionalProperties": true },
-    "cluster_profile": { "type": "object", "additionalProperties": true }
+    }
   }
 }

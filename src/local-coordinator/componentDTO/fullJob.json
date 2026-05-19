@@ -29,7 +29,7 @@
 
     "workload_data": {
       "type": "object",
-      "required": ["scaling_unit", "unit_count", "complexity_factor", "total_payload_size_mb"],
+      "required": ["total_payload_size_mb"],
       "additionalProperties": true,
       "properties": {
         "scaling_unit": { "type": "string" },
@@ -41,11 +41,11 @@
 
 	"data_context": {
 		"type": "object",
-		"required": ["input_uri", "output_uri", "patient_context_id"],
+		"required": ["input_uri", "output_uri", "subject_id"],
 		"properties": {
 			"input_uri": { "type": "string" },
 			"output_uri": { "type": "string" },
-			"patient_context_id": { "type": "string" },
+			"subject_id": { "type": "string" },
 			"extension": { "type": "string", "description": "File format/extension for input (e.g., dcm, nii)" },
 			"mime_type": { "type": "string", "description": "Optional MIME type (e.g., application/dicom)" }
 		}
