@@ -109,7 +109,7 @@ export default class DAGBuilder {
         // Build ctxMap
         const ctxMap = new Map();
         for (const f of fullContext) {
-        const key = `${f.job_id}::${f.stage_id}`;
+        const key = `${f.jobId}::${f.stageId}`;
         if (ctxMap.has(key)) throw new SchemaError(`Duplicate fullContext entry for ${key}`);
         ctxMap.set(key, f);
         }
@@ -117,11 +117,11 @@ export default class DAGBuilder {
         // Validate job-stage coverage
         for (const job of jobs) {
         const stages = job.pipeline?.stages ?? [];
-        if (!Array.isArray(stages) || stages.length === 0) throw new SchemaError(`Job ${job.job_id} missing pipeline.stages`);
+        if (!Array.isArray(stages) || stages.length === 0) throw new SchemaError(`Job ${job.jobId} missing pipeline.stages`);
         for (const s of stages) {
-            const key = `${job.job_id}::${s.stage_id}`;
+            const key = `${job.jobId}::${s.stageId}`;
             if (!ctxMap.has(key)) {
-            if (this.strict) throw new MissingContextError(job.job_id, s.stage_id);
+            if (this.strict) throw new MissingContextError(job.jobId, s.stageId);
             else throw new SchemaError(`Missing fullContext for ${key}`);
             }
         }
@@ -151,8 +151,8 @@ export default class DAGBuilder {
 
         // Deterministic ordering
         tasks.sort((a, b) => {
-        if (a.job_id < b.job_id) return -1;
-        if (a.job_id > b.job_id) return 1;
+        if (a.jobId < b.jobId) return -1;
+        if (a.jobId > b.jobId) return 1;
         if (a.id < b.id) return -1;
         if (a.id > b.id) return 1;
         return 0;
@@ -164,12 +164,12 @@ export default class DAGBuilder {
     #buildGraphForJob(job, ctxMap) {
         const stages = job.pipeline.stages;
         const stageToTask = {};
-        for (const s of stages) stageToTask[s.stage_id] = `${job.job_id}::${s.stage_id}`;
+        for (const s of stages) stageToTask[s.stageId] = `${job.jobId}::${s.stageId}`;
 
         // validate depends_on
         for (const s of stages) {
         for (const d of s.depends_on || []) {
-            if (!stageToTask[d]) throw new DAGValidationError(`Job ${job.job_id}: stage ${s.stage_id} depends on unknown ${d}`);
+            if (!stageToTask[d]) throw new DAGValidationError(`Job ${job.jobId}: stage ${s.stageId} depends on unknown ${d}`);
         }
         }
 
@@ -177,7 +177,7 @@ export default class DAGBuilder {
         const childrenMap = new Map();
         const taskDepends = {};
         for (const s of stages) {
-        const tid = stageToTask[s.stage_id];
+        const tid = stageToTask[s.stageId];
         const deps = (s.depends_on || []).map(d => stageToTask[d]);
         taskDepends[tid] = deps;
         for (const dep of deps) {
@@ -188,20 +188,20 @@ export default class DAGBuilder {
         }
 
         // depths
-        const depths = this.#computeDepths(taskDepends, job.job_id);
+        const depths = this.#computeDepths(taskDepends, job.jobId);
         const maxDepth = Object.keys(depths).length ? Math.max(...Object.values(depths)) : 0;
 
         // nodes
         const nodes = [];
         for (const s of stages) {
-        const tid = stageToTask[s.stage_id];
+        const tid = stageToTask[s.stageId];
         const ctx = ctxMap.get(tid);
         const sizeBytes = Number(ctx.S_hat ?? ctx.filesize ?? 0);
         const fileType = ctx.extension ?? null;
         const pipelineId = job.pipeline_id ?? job.pipeline?.id ?? null;
         const jobScore = Number(job.calculatedScore ?? job.calculated_score ?? 0);
         nodes.push(new TaskNode({
-            taskId: tid, jobId: job.job_id, pluginId: s.plugin_id, pipelineId,
+            taskId: tid, jobId: job.jobId, pluginId: s.plugin_id, pipelineId,
             fileType, sizeBytes, jobScore, dependsOn: taskDepends[tid] || [], children: childrenMap.get(tid) || [],
             depth: depths[tid] ?? 0, maxDepth, ctxEntry: ctx
         }));
@@ -286,7 +286,7 @@ export default class DAGBuilder {
         // Build task
         return {
         id: node.taskId,
-        job_id: node.jobId,
+        jobId: node.jobId,
         program_id: node.pluginId,
         duration_ms: durationMs,
         cpu: cpuMc,
