@@ -1,4 +1,3 @@
-// stateInterface.mjs
 'use strict';
 
 import {
@@ -41,6 +40,26 @@ class StateInterface {
     #toBytes(mb) {
         const n = Number(mb) || 0;
         return Math.max(0, Math.ceil(n * 1024 * 1024));
+    }
+    
+    // Internal helper to build a strict context object.
+    // Returns { pluginId, extension, extrasObj } where extrasObj is a plain object.
+    #makeStrictCtx(input = {}) {
+        if (!input || typeof input !== 'object') throw new Error('Invalid input object');
+
+        const pluginId = input.pluginId ?? input.plugin_id ?? input.plugin ?? null;
+        const extension = input.extension ?? input.file_type ?? input.ext ?? null;
+
+        if (!pluginId) throw new Error('pluginId required');
+        if (!extension) throw new Error('extension required');
+
+        // Extract extras from common keys or the object itself
+        const extras = input.context ?? input.contextFactors ?? input.contexts ?? input;
+
+        // Flatten extras deterministically into a plain object
+        const extrasObj = this.#flattenExtras(extras, pluginId, extension);
+
+        return { pluginId, extension, extrasObj };
     }
 
     // Flatten extras (array or object) into a plain object of keys -> values.
@@ -113,16 +132,16 @@ class StateInterface {
                 ctx = this.#makeStrictCtx(raw);
             } catch (err) {
                 fullContext.push({
-                    job_id: raw.job_id ?? raw.jobId ?? null,
-                    stage_id: raw.stage_id ?? raw.stageId ?? `idx-${i}`,
+                    jobId: raw.jobId ?? null,
+                    stageId: raw.stageId ?? `idx-${i}`,
                     error: `Invalid context: ${err.message}`
                 });
                 continue;
             }
 
             const { pluginId, extension, extrasObj } = ctx;
-            const job_id = raw.job_id ?? raw.jobId ?? null;
-            const stage_id = raw.stage_id ?? raw.stageId ?? `idx-${i}`;
+            const jobId =  raw.jobId ?? null;
+            const stageId = raw.stageId ?? `idx-${i}`;
 
             // 2. Determine Input Size (S_in)
             const stageFileSize = (raw.filesize == null) ? null : Number(raw.filesize);
@@ -208,8 +227,8 @@ class StateInterface {
             const computeWeight = this.#computeWeight(cpuProfile, memoryBytes, timeProfile);
 
             const model = {
-                job_id,
-                stage_id,
+                jobId,
+                stageId,
                 pluginId,
                 extension,
                 cpu: cpuProfile,
@@ -234,25 +253,59 @@ class StateInterface {
         return fullContext;
     }
 
-    // Internal helper to build a strict context object.
-    // Returns { pluginId, extension, extrasObj } where extrasObj is a plain object.
-    #makeStrictCtx(input = {}) {
-        if (!input || typeof input !== 'object') throw new Error('Invalid input object');
+    registerJobs(jobs = []) {
+        if (!Array.isArray(jobs) || jobs.length === 0) return;
 
-        const pluginId = input.pluginId ?? input.plugin_id ?? input.plugin ?? null;
-        const extension = input.extension ?? input.file_type ?? input.ext ?? null;
+        const BATCH_SIZE = 5;
+        const MAX_OUTSTANDING = 16; 
+        let queued = [];
+        let outstanding = 0;
 
-        if (!pluginId) throw new Error('pluginId required');
-        if (!extension) throw new Error('extension required');
+        const scheduleBatch = (batch) => {
+            // backpressure: delay scheduling if too many outstanding batches
+            if (outstanding >= MAX_OUTSTANDING) {
+                return setTimeout(() => scheduleBatch(batch), 10);
+            }
 
-        // Extract extras from common keys or the object itself
-        const extras = input.context ?? input.contextFactors ?? input.contexts ?? input;
+            outstanding++;
+            const batchCopy = batch.slice(); // capture snapshot
 
-        // Flatten extras deterministically into a plain object
-        const extrasObj = this.#flattenExtras(extras, pluginId, extension);
+            setImmediate(() => {
+                try {
+                    for (const j of batchCopy) {
+                        try {
+                            this.#Register.create(j); // synchronous create as you prefer
+                        } catch (err) {
+                            // per-job error isolation
+                            console.error('job create failed', j && j.jobId, err);
+                            // optionally push to a retry queue here
+                        }
+                    }
+                } finally {
+                    outstanding--;
+                }
+            });
+        };
 
-        return { pluginId, extension, extrasObj };
+        for (let i = 0; i < jobs.length; i++) {
+            queued.push(jobs[i]);
+
+            if ((i + 1) % BATCH_SIZE === 0) {
+                const batch = queued.slice();
+                queued.length = 0;
+                scheduleBatch(batch);
+            }
+        }
+
+        // final flush
+        if (queued.length > 0) {
+            const batch = queued.slice();
+            queued.length = 0;
+            scheduleBatch(batch);
+        }
     }
+
+
 
     // -------------------------
     // Convenience getters used by external callers
@@ -342,6 +395,9 @@ class StateInterface {
             diagnostics
         };
     }
+
+
+
 
     // -------------------------
     // Compute weight (scoring)
