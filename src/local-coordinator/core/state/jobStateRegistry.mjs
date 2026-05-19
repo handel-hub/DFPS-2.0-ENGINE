@@ -96,35 +96,48 @@ class JobStateRegistry {
     // Public registry API
     // -------------------------
 
-    createJob(jobId, taskList = [], metadata = {}) {
-        if (!jobId) throw new Error('jobId required');
+    createJob(normalizedJob) {
+        if (!normalizedJob || !normalizedJob.jobId) throw new Error('jobId required');
+        
+        const { jobId, pipeline = [] } = normalizedJob;
+        
         if (this.#jobs.has(jobId)) throw new Error(`job ${jobId} already exists`);
 
         const createdAt = this.#now();
         const tasks = new Map();
         let totalTasks = 0;
 
-        for (const t of taskList) {
-        if (!t || !t.taskId) throw new Error('taskList items must have taskId');
-        const task = {
-            taskId: t.taskId,
-            jobId,
-            status: 'PENDING',
-            retries: 0,
-            assignedWorker: t.assignedWorker ?? null,
-            startedAt: null,
-            completedAt: null,
-            lastError: null,
-            dependencies: new Set(t.dependencies ?? []),
-            dependents: new Set(),
-            unresolvedDepsCount: (t.dependencies ? t.dependencies.length : 0)
-        };
-        tasks.set(task.taskId, task);
-        this.#taskIndex.set(task.taskId, { jobId, task });
-        totalTasks++;
+        // 1. Map the normalized pipeline stages to internal task representations
+        for (const stage of pipeline) {
+            if (!stage || !stage.stageId) throw new Error('pipeline stages must have a stageId');
+            
+            // In the Normalizer schema, dependencies are stored in 'dependsOn'
+            const deps = stage.dependsOn || [];
+            
+            const task = {
+                taskId: stage.stageId,
+                jobId,
+                pluginId: stage.pluginId ?? null,      // Preserving plugin execution context
+                action: stage.action ?? null,          // Preserving the action
+                status: 'PENDING',
+                retries: 0,
+                assignedWorker: stage.assignedWorker ?? null,
+                startedAt: null,
+                completedAt: null,
+                lastError: null,
+                dependencies: new Set(deps),
+                dependents: new Set(),
+                unresolvedDepsCount: deps.length,
+                isCritical: stage.isCritical ?? false, // Mapped from schema
+                taskMetadata: stage.metadata ?? {}     // Stage-specific metadata
+            };
+            
+            tasks.set(task.taskId, task);
+            this.#taskIndex.set(task.taskId, { jobId, task });
+            totalTasks++;
         }
 
-        // Build dependents sets
+        // 2. Build dependents sets to complete the DAG
         for (const task of tasks.values()) {
             for (const dep of task.dependencies) {
                 const depEntry = tasks.get(dep);
@@ -135,6 +148,7 @@ class JobStateRegistry {
             }
         }
 
+        // 3. Construct the job record using the rich metadata
         const job = {
             jobId,
             status: 'PENDING',
@@ -144,47 +158,34 @@ class JobStateRegistry {
             failedTasks: 0,
             createdAt,
             updatedAt: createdAt,
-            metadata: metadata ?? {},
+            
+            // Attach RicherJob specific data contexts directly to the job state
+            modality: normalizedJob.modality ?? null,
+            priorityMetadata: normalizedJob.priorityMetadata ?? {},
+            workloadData: normalizedJob.workloadData ?? {},
+            dataContext: normalizedJob.dataContext ?? {},
+            computed: normalizedJob.computed ?? {},
+            metadata: normalizedJob.meta ?? {},
+            
             tags: new Set(),
             groupId: null
         };
 
         this.#jobs.set(jobId, job);
-        this.#appendChange('CREATE_JOB', jobId, null, { totalTasks, metadata: job.metadata });
-        return this.#safeClone({ jobId, totalTasks, createdAt });
-    }
-
-    getJob(jobId) {
-        this.#ensureJobShape(jobId);
-        const job = this.#jobs.get(jobId);
-        const tasks = {};
-        for (const [tid, t] of job.tasks.entries()) {
-            tasks[tid] = {
-                taskId: t.taskId,
-                status: t.status,
-                retries: t.retries,
-                assignedWorker: t.assignedWorker,
-                startedAt: t.startedAt,
-                completedAt: t.completedAt,
-                lastError: t.lastError,
-                dependencies: Array.from(t.dependencies),
-                dependents: Array.from(t.dependents),
-                unresolvedDepsCount: t.unresolvedDepsCount
-            };
-        }
-        return {
-            jobId: job.jobId,
-            status: job.status,
-            totalTasks: job.totalTasks,
-            completedTasks: job.completedTasks,
-            failedTasks: job.failedTasks,
-            createdAt: job.createdAt,
-            updatedAt: job.updatedAt,
-            metadata: this.#safeClone(job.metadata),
-            tags: Array.from(job.tags),
-            groupId: job.groupId,
-            tasks
-        };
+        
+        // 4. Record the append-only change log
+        this.#appendChange('CREATE_JOB', jobId, null, { 
+            totalTasks, 
+            priorityClass: job.priorityMetadata.class ?? 'DEFAULT',
+            dataContext: job.dataContext
+        });
+        
+        return this.#safeClone({ 
+            jobId, 
+            totalTasks, 
+            createdAt,
+            status: job.status
+        });
     }
 
     getAllJobs() {
@@ -200,6 +201,8 @@ class JobStateRegistry {
         return {
             taskId: t.taskId,
             jobId: t.jobId,
+            pluginId: t.pluginId,
+            action: t.action,
             status: t.status,
             retries: t.retries,
             assignedWorker: t.assignedWorker,
@@ -208,10 +211,45 @@ class JobStateRegistry {
             lastError: t.lastError,
             dependencies: Array.from(t.dependencies),
             dependents: Array.from(t.dependents),
-            unresolvedDepsCount: t.unresolvedDepsCount
-            };
+            unresolvedDepsCount: t.unresolvedDepsCount,
+            isCritical: t.isCritical,
+            taskMetadata: this.#safeClone(t.taskMetadata)
+        };
     }
 
+    getJob(jobId) {
+        this.#ensureJobShape(jobId);
+        const job = this.#jobs.get(jobId);
+        const tasks = {};
+        
+        for (const [tid, t] of job.tasks.entries()) {
+            // Leverage getTask to ensure consistent task formatting
+            tasks[tid] = this.getTask(tid);
+        }
+        
+        return {
+            jobId: job.jobId,
+            status: job.status,
+            totalTasks: job.totalTasks,
+            completedTasks: job.completedTasks,
+            failedTasks: job.failedTasks,
+            createdAt: job.createdAt,
+            updatedAt: job.updatedAt,
+            
+            // New RicherJob properties
+            modality: job.modality,
+            priorityMetadata: this.#safeClone(job.priorityMetadata),
+            workloadData: this.#safeClone(job.workloadData),
+            dataContext: this.#safeClone(job.dataContext),
+            computed: this.#safeClone(job.computed),
+            
+            // Existing metadata & organization
+            metadata: this.#safeClone(job.metadata),
+            tags: Array.from(job.tags),
+            groupId: job.groupId,
+            tasks
+        };
+    }
     getTasksByJob(jobId) {
         this.#ensureJobShape(jobId);
         const job = this.#jobs.get(jobId);
@@ -426,36 +464,8 @@ class JobStateRegistry {
     // exportState: state only (no changeLog)
     exportState() {
         const timeStore = {};
-        for (const [jobId, job] of this.#jobs.entries()) {
-        const tasks = {};
-        for (const [tid, t] of job.tasks.entries()) {
-            tasks[tid] = {
-                taskId: t.taskId,
-                jobId: t.jobId,
-                status: t.status,
-                retries: t.retries,
-                assignedWorker: t.assignedWorker,
-                startedAt: t.startedAt,
-                completedAt: t.completedAt,
-                lastError: t.lastError,
-                dependencies: Array.from(t.dependencies),
-                dependents: Array.from(t.dependents),
-                unresolvedDepsCount: t.unresolvedDepsCount
-            };
-        }
-        timeStore[jobId] = {
-            jobId: job.jobId,
-            status: job.status,
-            totalTasks: job.totalTasks,
-            completedTasks: job.completedTasks,
-            failedTasks: job.failedTasks,
-            createdAt: job.createdAt,
-            updatedAt: job.updatedAt,
-            metadata: this.#safeClone(job.metadata),
-            tags: Array.from(job.tags),
-            groupId: job.groupId,
-            tasks
-        };
+        for (const jobId of this.#jobs.keys()) {
+            timeStore[jobId] = this.getJob(jobId);
         }
         return { state: timeStore, exportedAt: this.#now() };
     }
@@ -479,10 +489,13 @@ class JobStateRegistry {
                 const tasks = new Map();
                 let completedTasks = 0;
                 let failedTasks = 0;
+                
                 for (const [tid, rt] of Object.entries(rawJob.tasks || {})) {
                     const t = {
                         taskId: rt.taskId,
                         jobId: jobId,
+                        pluginId: rt.pluginId ?? null,
+                        action: rt.action ?? null,
                         status: VALID_TASK_STATES.has(rt.status) ? rt.status : 'PENDING',
                         retries: Number.isFinite(Number(rt.retries)) ? Number(rt.retries) : 0,
                         assignedWorker: rt.assignedWorker ?? null,
@@ -491,7 +504,9 @@ class JobStateRegistry {
                         lastError: rt.lastError ?? null,
                         dependencies: new Set(Array.isArray(rt.dependencies) ? rt.dependencies : []),
                         dependents: new Set(Array.isArray(rt.dependents) ? rt.dependents : []),
-                        unresolvedDepsCount: Number.isFinite(Number(rt.unresolvedDepsCount)) ? Number(rt.unresolvedDepsCount) : 0
+                        unresolvedDepsCount: Number.isFinite(Number(rt.unresolvedDepsCount)) ? Number(rt.unresolvedDepsCount) : 0,
+                        isCritical: rt.isCritical ?? false,
+                        taskMetadata: rt.taskMetadata ?? {}
                     };
                     if (t.status === 'COMPLETED') completedTasks++;
                     if (t.status === 'FAILED') failedTasks++;
@@ -508,27 +523,35 @@ class JobStateRegistry {
                     failedTasks,
                     createdAt: Number.isFinite(Number(rawJob.createdAt)) ? rawJob.createdAt : this.#now(),
                     updatedAt: Number.isFinite(Number(rawJob.updatedAt)) ? rawJob.updatedAt : this.#now(),
+                    
+                    // Restore RicherJob properties safely
+                    modality: rawJob.modality ?? null,
+                    priorityMetadata: rawJob.priorityMetadata ?? {},
+                    workloadData: rawJob.workloadData ?? {},
+                    dataContext: rawJob.dataContext ?? {},
+                    computed: rawJob.computed ?? {},
+                    
                     metadata: rawJob.metadata ?? {},
                     tags: new Set(Array.isArray(rawJob.tags) ? rawJob.tags : []),
                     groupId: rawJob.groupId ?? null
                 };
 
                 for (const tag of job.tags) {
-                if (!this.#tagIndex.has(tag)) this.#tagIndex.set(tag, new Set());
-                this.#tagIndex.get(tag).add(jobId);
+                    if (!this.#tagIndex.has(tag)) this.#tagIndex.set(tag, new Set());
+                    this.#tagIndex.get(tag).add(jobId);
                 }
                 if (job.groupId) {
-                if (!this.#groupIndex.has(job.groupId)) this.#groupIndex.set(job.groupId, new Set());
-                this.#groupIndex.get(job.groupId).add(jobId);
+                    if (!this.#groupIndex.has(job.groupId)) this.#groupIndex.set(job.groupId, new Set());
+                    this.#groupIndex.get(job.groupId).add(jobId);
                 }
 
                 this.#jobs.set(jobId, job);
             } catch (err) {
+                // Skips corrupt jobs gracefully
                 continue;
             }
         }
     }
-
     reset() {
         this.#jobs.clear();
         this.#taskIndex.clear();
