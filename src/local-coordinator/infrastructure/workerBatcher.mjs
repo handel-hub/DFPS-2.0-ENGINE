@@ -4,15 +4,12 @@
 /**
  * WorkerBatcher (Commit C)
  *
- * - Uses registry.getChangeBatch(fromSeq, batchOptions) to build compact batches
  * - Persists batches to WAL (when storageMode includes 'disk' or fallback)
  * - Sends batches to MC via grpcSendFn (preferred) or dbAdapter.writeBatch
  * - Retries with exponential backoff + jitter
  * - Honors MC throttleMs and applies adaptive backpressure
- * - Compacts WAL after ack (delegates to registry.compactWalUpTo)
  *
  * Public API:
- *  - constructor(registry, cfg)
  *  - start()
  *  - stop({ flush })
  *  - flush()
@@ -37,14 +34,9 @@ function delayTimer(ms) { return new Promise(r => setTimeout(r, ms)); }
 function jitter(ms) { return Math.floor(Math.random() * ms); }
 
 class WorkerBatcher {
-    constructor(registry, cfg = {}) {
-        if (!registry) throw new Error('registry required');
-        this.registry = registry;
+    constructor(walInstance, fetchBatchFn, cfg = {}) {
 
-        // Obtain worker identification safely via explicit method checks
-        this.workerId = typeof registry.getWorkerId === 'function' 
-            ? registry.getWorkerId() 
-            : (registry.workerId || 'worker');
+        this.workerId = cfg.workerId || 'worker'
 
         this.cfg = Object.assign({
             storageMode: 'both',
@@ -64,7 +56,8 @@ class WorkerBatcher {
             throw new Error('grpcSendFn or dbAdapter required when storageMode includes db');
         }
 
-        this.wal = new WAL({ walDir: this.cfg.walDir, workerId: this.workerId, walRotateBytes: this.cfg.walRotateBytes });
+        this.wal = walInstance; 
+        this.fetchBatchFn = fetchBatchFn;
 
         this.queue = [];
         this.running = false;
@@ -133,12 +126,12 @@ class WorkerBatcher {
     }
 
     async #collectAndQueue() {
-        // FIX: Enforce real backpressure. Stop polling the registry if we hit critical limits.
+        
         if (this.queue.length >= this.cfg.criticalWaterMark) {
             return;
         }
 
-        const batch = this.registry.getChangeBatch(this.lastAckedSeq, this.cfg.batchOptions);
+        const batch = this.fetchBatchFn(this.lastAckedSeq, this.cfg.batchOptions);
         if (!batch || !batch.meta || batch.meta.count === 0) return;
 
         this.queue.push(batch);

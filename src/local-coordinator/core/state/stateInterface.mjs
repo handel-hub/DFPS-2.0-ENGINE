@@ -8,6 +8,11 @@ import {
     TimeProfileManager
 } from "./index.mjs";
 
+import { 
+    Wal,
+    WorkerBatcher 
+} from "../../infrastructure/index.mjs";
+
 class StateInterface {
     #Cpu;
     #Io;
@@ -21,6 +26,18 @@ class StateInterface {
         this.#Register = opts.Register || new JobStateRegistry();
         this.#Memory = opts.Memory || new MemoryProfileStore();
         this.#Time = opts.Time || new TimeProfileManager();
+
+        this.#Wal = opts.Wal || new Wal({ walDir: './wal', workerId });
+
+        const fetchBatchFn = (lastAckedSeq, batchOptions) => {
+            return this.#Register.getChangeBatch(lastAckedSeq, batchOptions);
+        };
+
+        this.#Batcher = opts.Batcher || new WorkerBatcher(this.#Wal, fetchBatchFn, {
+            workerId: workerId,
+            storageMode: 'both',
+            // ... grpc hooks go here
+        });
 
         // configuration knobs (small, local defaults)
         this._minStageOutputBytes = opts.minStageOutputBytes ?? 1024; // used only if you later enable propagation rules
@@ -305,6 +322,13 @@ class StateInterface {
         }
     }
 
+    async start() {
+        await this.#Batcher.start();
+    }
+
+    async stop() {
+        await this.#Batcher.stop();
+    }
 
 
     // -------------------------

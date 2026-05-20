@@ -692,56 +692,6 @@ class JobStateRegistry {
         return { fromSeq, toSeq, events: batch, meta: { count: batch.length, bytes } };
     }
 
-    // -------------------------
-    // Worker integration (placeholders for Commit B)
-    // -------------------------
-
-    startWorker(options = {}) {
-        if (this.#worker) return this.#worker;
-        const cfg = Object.assign({}, this._workerDefaults ?? {}, options);
-
-        // ensure workerId exists for WAL and sequence scoping
-        if (!this._workerId) {
-            if (cfg.workerId) this._workerId = cfg.workerId;
-            else throw new Error('workerId required to start worker (stable identity across restarts)');
-        }
-
-        // ensure WAL instance exists (created in Commit B constructor)
-        if (!this._wal) {
-            // create WAL if not already created (constructor may have created it)
-            // this._wal created in Commit B constructor if workerId present; ensure it's present
-            // (no-op here; WAL instance already created)
-        }
-
-        // instantiate real WorkerBatcher
-        this.#worker = new WorkerBatcher(this, cfg);
-        this.#worker.start();
-        return this.#worker;
-    }
-    
-    async stopWorker({ flush = true } = {}) {
-        if (!this.#worker) return;
-        await this.#worker.stop({ flush });
-        this.#worker = null;
-    }
-
-    // Placeholder: persist a batch to WAL (implemented in Commit B)
-    async persistBatchToWal(batch) {
-        if (!this._wal) {
-            // WAL not configured; no-op but return
-            return;
-        }
-         // wrap batch in envelope to include batch metadata for compaction
-        const envelope = { batch, workerId: this._workerId, toSeq: batch.toSeq ?? (batch.events && batch.events.length ? batch.events[batch.events.length-1].sequenceId : null) };
-        await this._wal.appendBatch(envelope);
-    }
-
-    // Placeholder: compact WAL up to sequence (implemented in Commit B)
-    async compactWalUpTo(seq) {
-        if (!this._wal) return;
-        await this._wal.compactUpTo(seq);
-    }
-
     debugDump() {
         const out = {
             jobs: {},
