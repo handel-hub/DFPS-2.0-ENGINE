@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import pidusage from "pidusage";
 
 
-class WorkerActions extends EventEmitter {
+export class WorkerActions extends EventEmitter {
     #data;
     #cwd;
     #resource
@@ -316,7 +316,7 @@ class WorkerActions extends EventEmitter {
 }
 
 
-class ProjectError extends Error {
+export class ProjectError extends Error {
     constructor(message, options = {}) {
         super(message);
         this.name = this.constructor.name;
@@ -329,7 +329,7 @@ class ProjectError extends Error {
     }
 }
 
-function logError(err) {
+export function logError(err) {
 
     const report = [
         "================ ERROR REPORT ================",

@@ -1,12 +1,16 @@
-import {  } from "./dagBuild.mjs";
-import extractContext from "./contextExtractor.mjs";
-
-
-
-
-
-
+import { 
+    DAGValidationError,
+    SchemaError,
+    MissingContextError,
+    CostingError,
+    NodeConfig,
+    DAGBuilder
+} from "./dagBuild.mjs";
+import { 
+    computeSolverWeight 
+} from './weightUtils.mjs';
 
 export {
-    extractContext
+    DAGBuilder,
+    computeSolverWeight
 }

@@ -3,6 +3,7 @@ import IOProfile from "./ioProfile.mjs";
 import JobStateRegistry from "./jobStateRegistry.mjs";
 import MemoryProfileStore from "./memoryProfileStore.mjs";
 import TimeProfileManager from "./timeProfile.mjs";
+import StateInterface from "./stateInterface.mjs"
 
 
 
@@ -11,5 +12,6 @@ export {
     IOProfile,
     JobStateRegistry,
     MemoryProfileStore,
-    TimeProfileManager
+    TimeProfileManager,
+    StateInterface
 };

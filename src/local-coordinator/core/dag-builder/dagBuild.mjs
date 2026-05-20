@@ -2,9 +2,9 @@
 'use strict';
 
 import Ajv from 'ajv';
-import jobSchema from '../schemas/job.schema.json' assert { type: 'json' };
-import fullContextSchema from '../schemas/fullContext.schema.json' assert { type: 'json' };
-import { computeSolverWeight } from './weightUtils.mjs';
+import {jobSchema} from '../schemas/job.schema.json' assert { type: 'json' };
+import {fullContextSchema} from '../schemas/fullContext.schema.json' assert { type: 'json' };
+import { computeSolverWeight } from './index.mjs';
 
 const ajv = new Ajv({ allErrors: true, useDefaults: true, strict: false });
 const validateJob = ajv.compile(jobSchema);

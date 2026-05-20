@@ -195,7 +195,7 @@ class WAL {
     }
 
     async compactUpTo(seq) {
-        await this.#ensureOpen(); // Assure currentFile string resolution
+        await this.#ensureOpen();
         await this.#ensureDir();
         
         const files = await fs.readdir(this.walDir).catch(() => []);
@@ -204,7 +204,6 @@ class WAL {
         for (const f of walFiles) {
             const p = path.join(this.walDir, f);
             
-            // CRITICAL FIX: Skip the active append file entirely from compaction
             if (this.currentFile && path.resolve(p) === path.resolve(this.currentFile)) {
                 continue;
             }
@@ -263,7 +262,6 @@ class WAL {
                     continue;
                 }
 
-                // Atomic safe rewrite
                 const tmp = p + '.tmp';
                 const outFd = await fs.open(tmp, 'w');
                 try {

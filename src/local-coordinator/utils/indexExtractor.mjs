@@ -1,13 +1,15 @@
 // indexExtractor.mjs
-import { Normalizer } from "./normalization.mjs";
-import { ContextExtractor } from "./contextExtractor.mjs";
-import { DagBuilderExtractor } from './dagExtractor.mjs';
+import { 
+    ContextExtractor,
+    DagBuilderExtractor,
+    Normalizer 
+} from "./index.mjs";
 
 const normal = new Normalizer();
 const contextExtractor = new ContextExtractor();
 const dagExtractor = new DagBuilderExtractor();
 
-export default function extract(jobsArray) {
+function extract(jobsArray) {
     const passed = [];
     const failed = [];
 
@@ -47,3 +49,5 @@ export default function extract(jobsArray) {
 
     return { passed, failed };
 }
+
+export default extract
