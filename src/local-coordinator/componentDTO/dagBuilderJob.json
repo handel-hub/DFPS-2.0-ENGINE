@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "required": ["job_id", "calculatedScore", "pipeline"],
+  "properties": {
+    "job_id": { "type": "string" },
+    "calculatedScore": { "type": "number" },
+    "pipeline": {
+      "type": "object",
+      "required": ["stages"],
+      "properties": {
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["stageId", "pluginId"],
+            "properties": {
+              "stageId": { "type": "string" },
+              "pluginId": { "type": "string" },
+              "depends_on": { 
+                "type": "array", 
+                "items": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
