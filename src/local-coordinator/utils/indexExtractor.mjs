@@ -18,7 +18,7 @@ function extract(jobsArray) {
     for (const fail of validationBatch.failed) {
         failed.push({
             jobId: fail.raw?.job_id ?? fail.raw?.jobId ?? null,
-            phase: 'normalization',
+            phase: 'normalization_error',
             errors: fail.errors,
             raw: fail.raw
         });
@@ -29,13 +29,13 @@ function extract(jobsArray) {
 
         const ctxRes = contextExtractor.profileContext([normalizedJob]);
         if (ctxRes.errors.length > 0) {
-            failed.push({ jobId: id, phase: 'context_extraction', errors: ctxRes.errors.map(e => e.error) });
+            failed.push({ jobId: id, phase: 'context_extraction_error', errors: ctxRes.errors.map(e => e.error) });
             continue;
         }
 
         const dagRes = dagExtractor.extractForDagBuilder([normalizedJob]);
         if (dagRes.errors.length > 0) {
-            failed.push({ jobId: id, phase: 'dag_building', errors: dagRes.errors.map(e => e.error) });
+            failed.push({ jobId: id, phase: 'dag_building_error', errors: dagRes.errors.map(e => e.error) });
             continue;
         }
 

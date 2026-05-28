@@ -69,7 +69,7 @@ class TaskNode {
 }
 
 /* DAGBuilder */
-export default class DAGBuilder {
+export class DAGBuilder {
     constructor({ strict = true, weightConfig = {} } = {}) {
         this.strict = strict;
         this.weightConfig = Object.assign({

@@ -25,10 +25,6 @@
  *  - maxQueueSize, highWaterMark, criticalWaterMark
  */
 
-// workerBatcher.mjs
-'use strict';
-
-import WAL from './wal.mjs';
 
 function delayTimer(ms) { return new Promise(r => setTimeout(r, ms)); }
 function jitter(ms) { return Math.floor(Math.random() * ms); }
