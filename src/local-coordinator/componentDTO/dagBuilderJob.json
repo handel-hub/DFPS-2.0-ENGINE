@@ -14,13 +14,21 @@
           "items": {
             "type": "object",
             "required": ["stageId", "pluginId"],
+            "additionalProperties": true,
             "properties": {
-              "stageId": { "type": "string" },
-              "pluginId": { "type": "string" },
-              "depends_on": { 
-                "type": "array", 
-                "items": { "type": "string" }
-              }
+              "stageId":            { "type": "string" },
+              "pluginId":           { "type": "string" },
+              "dependsOn":          { "type": "array", "items": { "type": "string" }, "default": [] },
+              "taskType":           { "type": "string" },
+              "action":             { "type": "string" },
+              "allowedWorkerTypes": { "type": "array", "items": { "type": "string" }, "default": ["ANY"] },
+              "resourceClass":      { "type": "string", "default": "NORMAL" },
+              "earliestStartMs":    { "type": "integer", "minimum": 0, "default": 0 },
+              "deadlineMs":         { "type": ["integer", "null"], "minimum": 0 },
+              "retryable":          { "type": "boolean", "default": true },
+              "maxRetries":         { "type": "integer", "minimum": 0, "default": 3 },
+              "isCritical":         { "type": "boolean", "default": false },
+              "metadata":           { "type": "object", "additionalProperties": true }
             }
           }
         }

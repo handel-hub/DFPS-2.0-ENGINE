@@ -50,9 +50,18 @@ export class DagBuilderExtractor {
                     }
 
                     mappedStages.push({
-                        stageId: stageId,
-                        pluginId: pluginId,
-                        dependsOn: dependsOn
+                        stageId,
+                        pluginId,
+                        dependsOn,
+                        // scheduling semantics — defaults applied here so dagBuild always sees clean values
+                        taskType:           stageRaw.taskType ?? stageRaw.action ?? null,
+                        allowedWorkerTypes: Array.isArray(stageRaw.allowedWorkerTypes) ? stageRaw.allowedWorkerTypes : ['ANY'],
+                        resourceClass:      stageRaw.resourceClass ?? 'NORMAL',
+                        earliestStartMs:    stageRaw.earliestStartMs ?? 0,
+                        deadlineMs:         stageRaw.deadlineMs ?? null,
+                        retryable:          stageRaw.retryable ?? true,
+                        maxRetries:         stageRaw.maxRetries ?? 3,
+                        isCritical:         stageRaw.isCritical ?? false,
                     });
                 }
 

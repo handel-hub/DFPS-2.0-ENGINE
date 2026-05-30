@@ -186,6 +186,36 @@ function validatePipeline(pipeline, errors) {
         if (stage.metadata !== undefined && !assertObject(stage.metadata, `${base}.metadata`, errors)) {
             // error already pushed
         }
+
+        // Scheduling semantics (optional, validated when present)
+        if (stage.taskType !== undefined && typeof stage.taskType !== 'string') {
+            errors.push(`${base}.taskType: must be a string`);
+        }
+        if (stage.allowedWorkerTypes !== undefined) {
+            if (!Array.isArray(stage.allowedWorkerTypes)) {
+                errors.push(`${base}.allowedWorkerTypes: must be an array of strings`);
+            } else if (stage.allowedWorkerTypes.some((t) => typeof t !== 'string')) {
+                errors.push(`${base}.allowedWorkerTypes: all entries must be strings`);
+            }
+        }
+        if (stage.resourceClass !== undefined && typeof stage.resourceClass !== 'string') {
+            errors.push(`${base}.resourceClass: must be a string`);
+        }
+        if (stage.earliestStartMs !== undefined &&
+            (!Number.isInteger(stage.earliestStartMs) || stage.earliestStartMs < 0)) {
+            errors.push(`${base}.earliestStartMs: must be a non-negative integer`);
+        }
+        if (stage.deadlineMs !== undefined && stage.deadlineMs !== null &&
+            (!Number.isInteger(stage.deadlineMs) || stage.deadlineMs < 0)) {
+            errors.push(`${base}.deadlineMs: must be a non-negative integer or null`);
+        }
+        if (stage.retryable !== undefined && typeof stage.retryable !== 'boolean') {
+            errors.push(`${base}.retryable: must be a boolean`);
+        }
+        if (stage.maxRetries !== undefined &&
+            (!Number.isInteger(stage.maxRetries) || stage.maxRetries < 0)) {
+            errors.push(`${base}.maxRetries: must be a non-negative integer`);
+        }
     });
 }
 

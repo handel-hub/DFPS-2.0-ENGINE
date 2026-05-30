@@ -189,7 +189,7 @@ class StateInterface {
             if (!cpuCall.ok) {
                 diagnostics.cpu.ok = false;
                 diagnostics.cpu.error = cpuCall.error;
-                diagnostics.errors.push({ stage: 'cpu', message: cpuCall.error, pluginId, extension, stage_id });
+                diagnostics.errors.push({ stage: 'cpu', message: cpuCall.error, pluginId, extension, stageId });
             } else {
                 diagnostics.cpu.value = cpuCall.value;
             }
@@ -199,7 +199,7 @@ class StateInterface {
             if (!memCall.ok) {
                 diagnostics.memory.ok = false;
                 diagnostics.memory.error = memCall.error;
-                diagnostics.errors.push({ stage: 'memory', message: memCall.error, pluginId, extension, stage_id });
+                diagnostics.errors.push({ stage: 'memory', message: memCall.error, pluginId, extension, stageId });
             } else {
                 const memMB = memCall.value;
                 diagnostics.memory.value = { memMB, memoryBytes: memMB == null ? null : this.#toBytes(memMB) };
@@ -211,7 +211,7 @@ class StateInterface {
             if (!timeCall.ok) {
                 diagnostics.time.ok = false;
                 diagnostics.time.error = timeCall.error;
-                diagnostics.errors.push({ stage: 'time', message: timeCall.error, pluginId, extension, stage_id });
+                diagnostics.errors.push({ stage: 'time', message: timeCall.error, pluginId, extension, stageId });
             } else {
                 diagnostics.time.value = timeCall.value;
             }
@@ -221,7 +221,7 @@ class StateInterface {
             if (!ioCall.ok) {
                 diagnostics.io.ok = false;
                 diagnostics.io.error = ioCall.error;
-                diagnostics.errors.push({ stage: 'io', message: ioCall.error, pluginId, extension, stage_id });
+                diagnostics.errors.push({ stage: 'io', message: ioCall.error, pluginId, extension, stageId });
             } else {
                 const p = ioCall.value;
                 // p is the raw predict output; normalize into a compact shape
@@ -250,11 +250,13 @@ class StateInterface {
                 extension,
                 cpu: cpuProfile,
                 memoryBytes,
-                duration_ms: timeProfile?.duration_ms ?? null,
-                spawn_latency_ms: timeProfile?.spawn_latency_ms ?? null,
+                durationMs: timeProfile?.duration_ms ?? timeProfile?.durationMs ?? null,
+                spawnLatencyMs: timeProfile?.spawn_latency_ms ?? timeProfile?.spawnLatencyMs ?? null,
                 computeWeight,
                 ioPrediction: diagnostics.io.value,
-                diagnostics
+                diagnostics,
+                payloadMb: this.#toMB(S_in_bytes),
+                estimatedOutputMb: diagnostics.io.value ? this.#toMB(diagnostics.io.value.S_hat) : 0,
             };
 
             fullContext.push(model);

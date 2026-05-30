@@ -52,7 +52,18 @@ export class NodeConfig {
 
 /* Internal Task Node */
 class TaskNode {
-    constructor({ taskId, jobId, pluginId, pipelineId, fileType, sizeBytes, jobScore, dependsOn = [], children = [], depth = 0, maxDepth = 0, ctxEntry = null }) {
+    constructor({
+        taskId, jobId, pluginId, pipelineId, fileType, sizeBytes, jobScore,
+        dependsOn = [], children = [], depth = 0, maxDepth = 0, ctxEntry = null,
+        // scheduling semantics sourced from job stage definition
+        taskType = null,
+        allowedWorkerTypes = ['ANY'],
+        resourceClass = 'NORMAL',
+        earliestStartMs = 0,
+        deadlineMs = null,
+        retryable = true,
+        maxRetries = 3,
+    }) {
         this.taskId = taskId;
         this.jobId = jobId;
         this.pluginId = pluginId;
@@ -65,6 +76,13 @@ class TaskNode {
         this.depth = depth;
         this.maxDepth = maxDepth;
         this.ctxEntry = ctxEntry;
+        this.taskType = taskType;
+        this.allowedWorkerTypes = allowedWorkerTypes;
+        this.resourceClass = resourceClass;
+        this.earliestStartMs = earliestStartMs;
+        this.deadlineMs = deadlineMs;
+        this.retryable = retryable;
+        this.maxRetries = maxRetries;
     }
 }
 
@@ -141,11 +159,11 @@ export class DAGBuilder {
         tasks.push(task);
         }
 
-        // Final validation: depends_on exist
+        // Final validation: dependsOn exist
         const produced = new Set(tasks.map(t => t.id));
         for (const t of tasks) {
-        for (const d of t.depends_on) {
-            if (!produced.has(d)) throw new DAGValidationError(`Task ${t.id} depends_on ${d} which is not present`);
+        for (const d of t.dependsOn) {
+            if (!produced.has(d)) throw new DAGValidationError(`Task ${t.id} dependsOn ${d} which is not present`);
         }
         }
 
@@ -166,9 +184,9 @@ export class DAGBuilder {
         const stageToTask = {};
         for (const s of stages) stageToTask[s.stageId] = `${job.jobId}::${s.stageId}`;
 
-        // validate depends_on
+        // validate dependsOn
         for (const s of stages) {
-        for (const d of s.depends_on || []) {
+        for (const d of s.dependsOn || []) {
             if (!stageToTask[d]) throw new DAGValidationError(`Job ${job.jobId}: stage ${s.stageId} depends on unknown ${d}`);
         }
         }
@@ -178,7 +196,7 @@ export class DAGBuilder {
         const taskDepends = {};
         for (const s of stages) {
         const tid = stageToTask[s.stageId];
-        const deps = (s.depends_on || []).map(d => stageToTask[d]);
+        const deps = (s.dependsOn || []).map(d => stageToTask[d]);
         taskDepends[tid] = deps;
         for (const dep of deps) {
             const arr = childrenMap.get(dep) || [];
@@ -198,12 +216,20 @@ export class DAGBuilder {
         const ctx = ctxMap.get(tid);
         const sizeBytes = Number(ctx.S_hat ?? ctx.filesize ?? 0);
         const fileType = ctx.extension ?? null;
-        const pipelineId = job.pipeline_id ?? job.pipeline?.id ?? null;
+        const pipelineId = job.pipelineId ?? job.pipeline_id ?? job.pipeline?.id ?? null;
         const jobScore = Number(job.calculatedScore ?? job.calculated_score ?? 0);
         nodes.push(new TaskNode({
-            taskId: tid, jobId: job.jobId, pluginId: s.plugin_id, pipelineId,
+            taskId: tid, jobId: job.jobId, pluginId: s.pluginId, pipelineId,
             fileType, sizeBytes, jobScore, dependsOn: taskDepends[tid] || [], children: childrenMap.get(tid) || [],
-            depth: depths[tid] ?? 0, maxDepth, ctxEntry: ctx
+            depth: depths[tid] ?? 0, maxDepth, ctxEntry: ctx,
+            // scheduling semantics - read from stage, default if absent
+            taskType:           s.taskType ?? s.action ?? null,
+            allowedWorkerTypes: Array.isArray(s.allowedWorkerTypes) ? s.allowedWorkerTypes : ['ANY'],
+            resourceClass:      s.resourceClass ?? 'NORMAL',
+            earliestStartMs:    s.earliestStartMs ?? 0,
+            deadlineMs:         s.deadlineMs ?? null,
+            retryable:          s.retryable ?? true,
+            maxRetries:         s.maxRetries ?? 3,
         }));
         }
         return nodes;
@@ -242,13 +268,13 @@ export class DAGBuilder {
     #costNode(node, nodeConfig) {
         const ctx = node.ctxEntry;
         // Validate required ctx fields
-        const required = ['duration_ms', 'memoryBytes'];
+        const required = ['durationMs', 'memoryBytes'];
         for (const r of required) {
         if (!Object.prototype.hasOwnProperty.call(ctx, r)) throw new SchemaError(`fullContext missing ${r} for ${node.taskId}`);
         }
 
         // Duration
-        const durationMs = Math.max(1, Math.floor(Number(ctx.duration_ms)));
+        const durationMs = Math.max(1, Math.floor(Number(ctx.durationMs)));
 
         // CPU: accept numeric millicores or object {avgCpu, confidence}
         let cpuMc = null;
@@ -268,16 +294,16 @@ export class DAGBuilder {
         else throw new SchemaError(`fullContext.memoryBytes/memMB missing for ${node.taskId}`);
 
         // Spawn latency
-        const spawnMs = Number.isFinite(Number(ctx.spawn_latency_ms)) ? Math.max(0, Math.floor(Number(ctx.spawn_latency_ms))) : 0;
+        const spawnMs = Number.isFinite(Number(ctx.spawnLatencyMs ?? ctx.spawn_latency_ms)) ? Math.max(0, Math.floor(Number(ctx.spawnLatencyMs ?? ctx.spawn_latency_ms))) : 0;
 
         // Feasibility checks
         if (cpuMc > nodeConfig.safe_cpu) throw new CostingError(`cpu requirement ${cpuMc} > node safe_cpu ${nodeConfig.safe_cpu}`, node.taskId, 'cpu', cpuMc);
         if (ramMb > nodeConfig.safe_ram) throw new CostingError(`ram requirement ${ramMb} > node safe_ram ${nodeConfig.safe_ram}`, node.taskId, 'ram', ramMb);
 
-        // pos_weight
+        // posWeight
         const posWeight = this.#computePosWeight(node.depth, node.maxDepth);
 
-        // solver_weight
+        // solverWeight
         const cpuProfile = (typeof ctx.cpu === 'object') ? ctx.cpu : { avgCpu: Math.min(1, cpuMc / 4000), confidence: this.weightConfig.defaultConfidence };
         const memBytes = Number(ctx.memoryBytes);
         const durMs = durationMs;
@@ -285,24 +311,39 @@ export class DAGBuilder {
 
         // Build task
         return {
+        // identity
         id: node.taskId,
-        jobId: node.jobId,
-        program_id: node.pluginId,
-        duration_ms: durationMs,
+        job_id: node.jobId,
+        plugin_id: node.pluginId,
+        // execution estimates
+        duration_ms,
         cpu: cpuMc,
         ram: ramMb,
         spawn_latency_ms: spawnMs,
+        // payload propagation (from fullContext)
+        payload_mb: Number.isFinite(Number(ctx.payloadMb)) ? Number(ctx.payloadMb) : null,
+        estimated_output_mb: Number.isFinite(Number(ctx.estimatedOutputMb)) ? Number(ctx.estimatedOutputMb) : null,
+        // scheduling
         job_score: node.jobScore,
-        pos_weight: posWeight,
-        solver_weight: solverWeight,
+        pos_weight,
+        solver_weight,
+        // scheduling semantics
+        task_type: node.taskType,
+        allowed_worker_types: node.allowedWorkerTypes,
+        resource_class: node.resourceClass,
+        earliest_start_ms: node.earliestStartMs,
+        deadline_ms: node.deadlineMs,
+        retryable: node.retryable,
+        max_retries: node.maxRetries,
+        // dag
         depends_on: [...node.dependsOn],
         children: [...node.children],
         diagnostics: {
             source: ctx.source ?? 'fullContext',
-            schemaVersion: ctx.schemaVersion ?? null,
-            cpuProfile: ctx.cpu ?? null,
-            memMB: ramMb,
-            duration_ms: durationMs
+            schema_version: ctx.schemaVersion ?? null,
+            cpu_profile: ctx.cpu ?? null,
+            mem_mB: ramMb,
+            duration_ms
         }
         };
     }
