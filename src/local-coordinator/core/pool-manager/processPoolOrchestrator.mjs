@@ -16,10 +16,10 @@ class ProcessPoolOrchestrator {
     #onEvent;
 
     // temp claims: Map<tempKey, { slotId, timer, pluginId }>
-    #_tempClaims;
+    #tempClaims;
 
     // Map workerId -> originating tempKey (used to cancel claim timers on spawn timeout)
-    #_workerTempKeyMap;
+    #workerTempKeyMap;
 
     constructor(config = {}, onEvent) {
         if (typeof onEvent !== "function") {
@@ -43,8 +43,8 @@ class ProcessPoolOrchestrator {
         this.#actions = new WorkerActions(config.cwd ?? process.cwd());
         this.#onEvent = onEvent;
 
-        this.#_tempClaims = new Map();
-        this.#_workerTempKeyMap = new Map();
+        this.#tempClaims = new Map();
+        this.#workerTempKeyMap = new Map();
 
         this.#actions.on("update", (event) => this.#handle(event));
     }
@@ -151,7 +151,7 @@ class ProcessPoolOrchestrator {
             return "REJECTED";
         }
 
-        const claim = this._claimWarmSlotWithTimeout(pluginId);
+        const claim = this.#claimWarmSlotWithTimeout(pluginId);
         if (!claim) {
             this.#emit("WORKER_SPAWN_REJECTED_NO_SLOT", { pluginId, caller });
             this.#emitMetric("worker.spawn.rejected.no_slot", 1, { pluginId });
@@ -170,7 +170,7 @@ class ProcessPoolOrchestrator {
 
         const pluginId = pluginData.pluginId;
 
-        const entry = Array.from(this.#_tempClaims.entries()).find(([, v]) => v.slotId === slotId);
+        const entry = Array.from(this.#tempClaims.entries()).find(([, v]) => v.slotId === slotId);
         if (!entry) {
             this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId, pluginId, reason: "SLOT_NOT_CLAIMED", caller });
             return "REJECTED";
@@ -179,8 +179,8 @@ class ProcessPoolOrchestrator {
         const [tempKey, claim] = entry;
 
         // Cancel claim timer and keep mapping until spawn completes
-        this._cancelClaim(tempKey);
-        try { this.#_workerTempKeyMap.set(workerId, tempKey); } catch (_) { /* ignore */ }
+        this.#cancelClaim(tempKey);
+        try { this.#workerTempKeyMap.set(workerId, tempKey); } catch (_) { /* ignore */ }
 
         try {
             // Validate slot still belongs to tempKey (best-effort)
@@ -188,7 +188,7 @@ class ProcessPoolOrchestrator {
                 const tempSlotId = this.#slots.getSlotIdForWorker(tempKey);
                 if (tempSlotId !== slotId) {
                     this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId, pluginId, reason: "TEMPKEY_MISMATCH", caller });
-                    this.#_workerTempKeyMap.delete(workerId);
+                    this.#workerTempKeyMap.delete(workerId);
                     return "REJECTED";
                 }
             } catch (err) {
@@ -214,7 +214,7 @@ class ProcessPoolOrchestrator {
                 if (newSlotId === null || newSlotId === undefined) {
                     try { this.#slots.add(tempKey, claim.pluginId ?? pluginId, true); } catch (_) { /* ignore */ }
                     this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId, pluginId, reason: "NO_WORKER_SLOT_AVAILABLE", caller });
-                    this.#_workerTempKeyMap.delete(workerId);
+                    this.#workerTempKeyMap.delete(workerId);
                     return "REJECTED";
                 }
             }
@@ -227,7 +227,7 @@ class ProcessPoolOrchestrator {
                 try { this.#slots.add(tempKey, claim.pluginId ?? pluginId, true); } catch (_) { /* ignore */ }
                 logError(new ProjectError(`createWorkerRecord failed: ${err?.message}`, { workerId }));
                 this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId: newSlotId, pluginId, reason: "REGISTRY_FAILURE", caller });
-                this.#_workerTempKeyMap.delete(workerId);
+                this.#workerTempKeyMap.delete(workerId);
                 return "REJECTED";
             }
 
@@ -240,7 +240,7 @@ class ProcessPoolOrchestrator {
                 try { this.#slots.freeSlots(workerId); } catch (_) { /* ignore */ }
                 logError(new ProjectError(`updateState STARTING failed: ${err?.message}`, { workerId }));
                 this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId: newSlotId, pluginId, reason: "STATE_TRANSITION_FAILURE", caller });
-                this.#_workerTempKeyMap.delete(workerId);
+                this.#workerTempKeyMap.delete(workerId);
                 return "REJECTED";
             }
 
@@ -249,20 +249,20 @@ class ProcessPoolOrchestrator {
                 logError(spawnResult);
                 this.#forceCleanup(workerId, "CREATE_SYNC_FAILURE");
                 this.#emit("WORKER_SPAWN_FAILED", { workerId, slotId: newSlotId, pluginId, message: spawnResult.message, caller });
-                this.#_workerTempKeyMap.delete(workerId);
+                this.#workerTempKeyMap.delete(workerId);
                 return "REJECTED";
             }
 
             this.#emit("WORKER_SPAWN_INITIATED", { workerId, slotId: newSlotId, pluginId, caller });
             this.#emitMetric("worker.spawn.initiated", 1, { pluginId });
 
-            try { this._assertInvariants(); } catch (_) { /* ignore */ }
+            try { this.#assertInvariants(); } catch (_) { /* ignore */ }
 
             return "ACCEPTED";
         } catch (err) {
             logError(new ProjectError(`bindWorkerToSlot failed: ${err?.message}`, { workerId }));
             this.#emit("WORKER_SLOT_BIND_FAILED", { workerId, slotId, pluginId, reason: err?.message, caller });
-            this.#_workerTempKeyMap.delete(workerId);
+            this.#workerTempKeyMap.delete(workerId);
             return "REJECTED";
         }
     }
@@ -506,10 +506,10 @@ class ProcessPoolOrchestrator {
 
             // Clear any tempKey mapping now that spawn completed
             try {
-                const tempKey = this.#_workerTempKeyMap.get(workerId);
+                const tempKey = this.#workerTempKeyMap.get(workerId);
                 if (tempKey) {
-                    this._cancelClaim(tempKey);
-                    this.#_workerTempKeyMap.delete(workerId);
+                    this.#cancelClaim(tempKey);
+                    this.#workerTempKeyMap.delete(workerId);
                 }
             } catch (_) { /* ignore */ }
         } catch (err) {
@@ -525,10 +525,10 @@ class ProcessPoolOrchestrator {
         this.#emitMetric("worker.spawn.timeout", 1, { pluginId: worker?.pluginId });
 
         try {
-            const tempKey = this.#_workerTempKeyMap.get(workerId);
+            const tempKey = this.#workerTempKeyMap.get(workerId);
             if (tempKey) {
-                this._cancelClaim(tempKey);
-                this.#_workerTempKeyMap.delete(workerId);
+                this.#cancelClaim(tempKey);
+                this.#workerTempKeyMap.delete(workerId);
             }
         } catch (_) { /* ignore */ }
 
@@ -586,10 +586,10 @@ class ProcessPoolOrchestrator {
         }
 
         try {
-            const tempKey = this.#_workerTempKeyMap.get(workerId);
+            const tempKey = this.#workerTempKeyMap.get(workerId);
             if (tempKey) {
-                this._cancelClaim(tempKey);
-                this.#_workerTempKeyMap.delete(workerId);
+                this.#cancelClaim(tempKey);
+                this.#workerTempKeyMap.delete(workerId);
             }
         } catch (_) { /* ignore */ }
 
@@ -606,7 +606,7 @@ class ProcessPoolOrchestrator {
 
     // ---------------- Claim helpers ----------------
 
-    _generateTempKey(pluginId) {
+    #generateTempKey(pluginId) {
         try {
             if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
                 return `temp:${pluginId}:${crypto.randomUUID()}`;
@@ -615,30 +615,30 @@ class ProcessPoolOrchestrator {
         return `temp:${pluginId}:${Date.now()}:${Math.floor(Math.random() * 10000)}`;
     }
 
-    _claimWarmSlotWithTimeout(pluginId) {
-        const tempKey = this._generateTempKey(pluginId);
+    #claimWarmSlotWithTimeout(pluginId) {
+        const tempKey = this.#generateTempKey(pluginId);
         const slotId = this.#slots.add(tempKey, pluginId, true);
         if (slotId === null || slotId === undefined) return null;
 
         const timer = setTimeout(() => {
-            const claim = this.#_tempClaims.get(tempKey);
+            const claim = this.#tempClaims.get(tempKey);
             if (claim) {
                 try { this.#slots.freeSlots(tempKey); } catch (_) { /* ignore */ }
-                this.#_tempClaims.delete(tempKey);
+                this.#tempClaims.delete(tempKey);
                 this.#emit("WORKER_SLOT_CLAIM_EXPIRED", { slotId: claim.slotId, pluginId: claim.pluginId, tempKey });
                 this.#emitMetric("worker.slot.claim.expired", 1, { pluginId });
             }
         }, this.config.claimTTLMs);
 
-        this.#_tempClaims.set(tempKey, { slotId, timer, pluginId });
+        this.#tempClaims.set(tempKey, { slotId, timer, pluginId });
         return { slotId, tempKey };
     }
 
-    _cancelClaim(tempKey) {
-        const claim = this.#_tempClaims.get(tempKey);
+    #cancelClaim(tempKey) {
+        const claim = this.#tempClaims.get(tempKey);
         if (!claim) return false;
         try { clearTimeout(claim.timer); } catch (_) { /* ignore */ }
-        this.#_tempClaims.delete(tempKey);
+        this.#tempClaims.delete(tempKey);
         return true;
     }
 
@@ -702,7 +702,7 @@ class ProcessPoolOrchestrator {
 
     // ---------------- Invariant checks ----------------
 
-    _assertInvariants() {
+    #assertInvariants() {
         try {
             const slotStats = this.#slots.slotStats();
             const regCounts = this.#register.getStateCounts();
@@ -712,7 +712,7 @@ class ProcessPoolOrchestrator {
                 this.#emit("RECONCILE_REPORT", { reason: "SLOT_REG_MISMATCH", slotStats, regCounts });
             }
         } catch (err) {
-            logError(new ProjectError(`_assertInvariants failed: ${err?.message}`));
+            logError(new ProjectError(`#assertInvariants failed: ${err?.message}`));
         }
     }
 }
