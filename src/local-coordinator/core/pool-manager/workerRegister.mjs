@@ -158,10 +158,16 @@ class Register {
     markDead(id)     { return this.updateState(id, 'DEAD'); }
 
     assignWork(id, taskData = {}) {
-        this.updateState(id, 'BUSY'); // Throws if invalid
+        this.updateState(id, 'BUSY'); 
         const { assignedAt, ...safeTaskData } = taskData;
         const worker = this.#registry.get(id);
-        worker.metadata = { ...worker.metadata, ...safeTaskData };
+        
+        // Initialize the heartbeat when work starts
+        worker.metadata = { 
+            ...worker.metadata, 
+            ...safeTaskData,
+            lastHeartbeatAt: Date.now() 
+        };
         return true;
     }
 
@@ -212,7 +218,17 @@ class Register {
         }
         return null;
     }
-    getStalledWorkers(timeoutMs) {
+
+    // NEW: Slide the window forward
+    updateHeartbeat(id) {
+        const worker = this.#registry.get(id);
+        if (worker && worker.state === 'BUSY') {
+            worker.metadata.lastHeartbeatAt = Date.now();
+        }
+    }
+
+    // UPDATED: Check for silence, not total execution time
+    getStalledWorkers(maxSilenceMs) {
         const now = Date.now();
         const busyIds = this.#stateIndex.get('BUSY');
         if (!busyIds) return [];
@@ -220,9 +236,11 @@ class Register {
         return Array.from(busyIds)
             .map(id => this.#registry.get(id))
             .filter(w => {
-                const assignedAt = w?.metadata?.assignedAt;
-                if (!assignedAt || !Number.isFinite(assignedAt)) return false;
-                return (now - assignedAt) > timeoutMs;
+                const lastBeat = w?.metadata?.lastHeartbeatAt;
+                if (!lastBeat || !Number.isFinite(lastBeat)) return false;
+                
+                // Has the worker been completely silent longer than allowed?
+                return (now - lastBeat) > maxSilenceMs;
             })
             .map(w => this.getWorker(w.workerId));
     }

@@ -536,6 +536,7 @@ class ProcessPoolOrchestrator {
     }
 
     #onRuntimeUpdate(workerId, event) {
+        try { this.#register.registerHeartbeat(workerId); } catch(_) {}
         this.#emit("WORKER_UPDATE", { workerId, pluginId: this.#register.getWorker(workerId)?.pluginId, data: event.data });
     }
 
@@ -597,10 +598,12 @@ class ProcessPoolOrchestrator {
     }
 
     #onRawLog(workerId, event) {
+        try { this.#register.registerHeartbeat(workerId); } catch(_) {}
         this.#emit("WORKER_LOG", { workerId, level: "info", data: event.data });
     }
 
     #onStderrLog(workerId, event) {
+        try { this.#register.registerHeartbeat(workerId); } catch(_) {}
         this.#emit("WORKER_LOG", { workerId, level: "warn", data: event.data });
     }
 
