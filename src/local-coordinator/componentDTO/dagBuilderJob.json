@@ -2,7 +2,7 @@
   "type": "object",
   "required": ["job_id", "calculatedScore", "pipeline"],
   "properties": {
-    "job_id": { "type": "string" },
+    "jobId": { "type": "string" },
     "calculatedScore": { "type": "number" },
     "pipeline": {
       "type": "object",

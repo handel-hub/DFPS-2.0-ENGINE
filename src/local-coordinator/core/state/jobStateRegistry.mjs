@@ -115,7 +115,7 @@ class JobStateRegistry {
             const deps = stage.dependsOn || [];
             
             const task = {
-                taskId: stage.stageId,
+                taskId:`${jobId}::${stage.stageId}`,
                 jobId,
                 pluginId: stage.pluginId ?? null,      // Preserving plugin execution context
                 action: stage.action ?? null,          // Preserving the action

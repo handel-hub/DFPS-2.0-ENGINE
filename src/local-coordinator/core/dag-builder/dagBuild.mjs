@@ -312,7 +312,7 @@ export class DAGBuilder {
         // Build task
         return {
         // identity
-        id: node.taskId,
+        task_id: node.taskId,
         job_id: node.jobId,
         plugin_id: node.pluginId,
         // execution estimates
