@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "jest --runInBand"
+    "test": "jest --runInBand --config jest.config.cjs"
   },
   "keywords": [],
   "author": "",
@@ -21,9 +21,5 @@
   },
   "devDependencies": {
     "jest": "^30.3.0"
-  },
-  "jest": {
-    "testEnvironment": "node",
-    "transform": {}
   }
 }
