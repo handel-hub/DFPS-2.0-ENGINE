@@ -21,7 +21,8 @@ class RuntimeOchestrator extends EventEmitter {
 	#Batcher
 	#dag
 	#dagList
-	#pendingDag
+	#toExecDag
+	#execDagMap
 
 	#sequence
 	#dagPoint
@@ -44,9 +45,12 @@ class RuntimeOchestrator extends EventEmitter {
 		
 		this.#errorLog = [];
 		this.#dagList = [];
-		this.#pendingDag = []
+		this.#toExecDag = []
 		this.#sequence = 0;
 		this.#dagPoint = 0
+
+		this.#execDagMap = new Map()
+		this.#execDagMap.set('queue',Array(Number(config.workerSlot ?? Math.max(1, os.cpus().length - 1))))
 
 		this.on('jobsAvailable',(data)=>{
 			#handleJob(data)
@@ -80,10 +84,14 @@ class RuntimeOchestrator extends EventEmitter {
 		const {normalizedJob,context,dag} = extractedData.passed
 		const completeContext = this.#State.completeContext(context)
 		this.#State.registerJobs(normalizedJob)
-		const dag = this.#Dag.buildBatch(dag,completeContext)	
-
-		this.#dagList.push(dag)
-		this.#pushDag()
+		const dagData = this.#Dag.buildBatch(dag,completeContext)	
+		
+		this.#dagList.push(
+			{
+				dagNumber:this.#dagPoint++,
+				dag: dagData
+			}
+		)
 	}
 
 	#handleErrors(errors = []){
@@ -115,10 +123,8 @@ class RuntimeOchestrator extends EventEmitter {
     
 	}
 
-	#pushDag(){
-		const length = this.#dagList.length
-		this.#dagPoint
+	////////MAIN OCHESTRATION//////////////
+	//////////////////////////////////////
 
-	}
 	
 }
