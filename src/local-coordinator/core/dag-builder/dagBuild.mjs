@@ -4,7 +4,6 @@
 import Ajv from 'ajv';
 import {jobSchema} from '../schemas/job.schema.json' assert { type: 'json' };
 import {fullContextSchema} from '../schemas/fullContext.schema.json' assert { type: 'json' };
-import { computeSolverWeight } from './index.mjs';
 
 const ajv = new Ajv({ allErrors: true, useDefaults: true, strict: false });
 const validateJob = ajv.compile(jobSchema);
@@ -307,7 +306,6 @@ export class DAGBuilder {
         const cpuProfile = (typeof ctx.cpu === 'object') ? ctx.cpu : { avgCpu: Math.min(1, cpuMc / 4000), confidence: this.weightConfig.defaultConfidence };
         const memBytes = Number(ctx.memoryBytes);
         const durMs = durationMs;
-        const solverWeight = computeSolverWeight({ cpuProfile, memoryBytes: memBytes, durationMs: durMs, config: this.weightConfig });
 
         // Build task
         return {
@@ -326,18 +324,15 @@ export class DAGBuilder {
         // scheduling
         job_score: node.jobScore,
         pos_weight,
-        solver_weight,
         // scheduling semantics
         task_type: node.taskType,
         allowed_worker_types: node.allowedWorkerTypes,
         resource_class: node.resourceClass,
-        earliest_start_ms: node.earliestStartMs,
         deadline_ms: node.deadlineMs,
-        retryable: node.retryable,
-        max_retries: node.maxRetries,
         // dag
         depends_on: [...node.dependsOn],
         children: [...node.children],
+        plugin_group,
         diagnostics: {
             source: ctx.source ?? 'fullContext',
             schema_version: ctx.schemaVersion ?? null,

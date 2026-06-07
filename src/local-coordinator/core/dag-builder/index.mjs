@@ -6,11 +6,8 @@ import {
     NodeConfig,
     DAGBuilder
 } from "./dagBuild.mjs";
-import { 
-    computeSolverWeight 
-} from './weightUtils.mjs';
+
 
 export {
     DAGBuilder,
-    computeSolverWeight
 }
