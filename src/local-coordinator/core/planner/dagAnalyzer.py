@@ -2,7 +2,7 @@ import heapq
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Dict, Set, Optional, Tuple
+from typing import List, Dict, Set, Tuple
 
 logger = logging.getLogger("PlannerDAGAnalyzer")
 
@@ -14,15 +14,35 @@ class RejectReason(str, Enum):
 
 @dataclass(slots=True)
 class Task:
+    # Identifiers
     task_id: str
     job_id: str
-    cpu: float
-    ram: float
+    plugin_id: str
+
+    # Raw Temporal Metrics
     duration_ms: int
-    resource_class: str
+    spawn_latency_ms: int
+
+    # Network Metrics
+    input_transfer_ms: int
+    output_transfer_ms: int
+
+    # Business & Scheduling Constraints
+    job_score: float
+    
+    # Resource Constraints
+    cpu: int
+    ram: int
     task_type: str
-    depends_on: List[str] = field(default_factory=list)
-    children: List[str] = field(default_factory=list)
+    resource_class: str
+
+    allowed_worker_types: List[str] = field(default_factory=lambda: [])
+    
+    # Structural Topology
+    depends_on: List[str] = field(default_factory=lambda: [])  # Parent task_ids
+    children: List[str] = field(default_factory=lambda: [])    # Child task_ids
+
+
 
 @dataclass
 class InputGraph:
