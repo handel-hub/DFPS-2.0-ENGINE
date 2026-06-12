@@ -34,9 +34,6 @@ class Task:
     cpu: int
     ram: int
     task_type: str
-    resource_class: str
-
-    allowed_worker_types: List[str] = field(default_factory=lambda: [])
     
     # Structural Topology
     depends_on: List[str] = field(default_factory=lambda: [])  # Parent task_ids

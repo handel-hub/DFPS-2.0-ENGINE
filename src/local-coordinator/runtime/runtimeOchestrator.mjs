@@ -28,6 +28,8 @@ class RuntimeOchestrator extends EventEmitter {
 	#dagPoint
 	constructor(config = {}) {
 
+		this.schedulingNum = config.schedulingNum ?? 10
+
 		this.#maxDag = config.maxDag ?? 1000; //value is a guesse one refinement will be done after tests 
 		this.#State = new StateInterface();
 		this.#extract = extract;
@@ -50,6 +52,7 @@ class RuntimeOchestrator extends EventEmitter {
 		this.#dagPoint = 0
 
 		this.#execDagMap = new Map()
+		this.failed = []
 		this.#execDagMap.set('queue',Array(Number(config.workerSlot ?? Math.max(1, os.cpus().length - 1))))
 
 		this.on('jobsAvailable',(data)=>{
@@ -126,5 +129,27 @@ class RuntimeOchestrator extends EventEmitter {
 	////////MAIN OCHESTRATION//////////////
 	//////////////////////////////////////
 
-	
+	handleSchedule(){
+		const addExec = this.schedulingNum - this.#execDagMap.size
+
+		if (addExec > 0) {
+			const newTask = this.#toExecDag.slice(-addExec)
+			const filteredTask = this.scan(newTask)
+			filteredTask.forEach((task)=>{
+				this.#execDagMap.set(task.taskId,task)
+			})
+
+			const newSetNum = this.#toExecDag.length - addExec
+			const newSetDag = this.#toExecDag.slice(0,newSetNum)
+			this.#toExecDag = newSetDag
+			
+		}
+
+	}
+
+	scan(tasks = []) {
+		return tasks.filter(task => !this.failed.includes(task.jobId));
+	}
+
+
 }

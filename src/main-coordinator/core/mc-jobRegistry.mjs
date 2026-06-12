@@ -3,4 +3,5 @@ class jobRegistry {
 	constructor() {
 		
 	}
+	
 }
