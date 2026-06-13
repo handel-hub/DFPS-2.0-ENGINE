@@ -1,6 +1,6 @@
 import math
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Set
 
 # ---------------------------------------------------------
 # INPUT CONTRACTS
@@ -23,21 +23,16 @@ class TemporalTask:
     network_io_bytes: Optional[int] = None 
 
 # ---------------------------------------------------------
-# OUTPUT CONTRACT
+# OUTPUT CONTRACTS
 # ---------------------------------------------------------
 @dataclass
 class ResourceTaskVector:
     task_id: str
     
-    # Raw & Normalized Cost Vectors (Pure Spatial)
+    # Raw & Normalized Cost Vectors (Pure Spatial, Burst-Aware)
     cpu_cost: float
     ram_cost: float
-    io_cost: float
     network_cost: float
-    
-    # Pass-Through Temporal Metrics (For Stage 4 & 5)
-    duration_ms: int
-    spawn_latency_ms: int
     
     # Derived Optimization Costs
     resource_cost_score: int
@@ -47,79 +42,81 @@ class ResourceTaskVector:
     # Hard Limit Flags
     exceeds_cpu: bool
     exceeds_ram: bool
-    exceeds_io: bool
+    exceeds_network: bool
+    
+    # Isolated Telemetry Diagnostic
+    io_wait_ratio: float
 
+@dataclass
+class SpatialPipelineResult:
+    # Tasks that passed spatial validation
+    feasible_vectors: Dict[str, ResourceTaskVector] = field(default_factory=lambda: {})    
+    # Tasks that violated hardware ceilings (Primary Rejections)
+    invalid_roots: Set[str] = field(default_factory=lambda: set())
 # ---------------------------------------------------------
 # STAGE 3 PIPELINE EXECUTION
 # ---------------------------------------------------------
 def compile_resource_task_vector(task: TemporalTask, worker_profile: WorkerProfile) -> ResourceTaskVector:
     # --- PRE-PROCESSING & ALIGNMENT ---
-    # 1. Terminology alignment
     task_time_ms = task.duration_ms
+    active_network_time_ms = task.input_transfer_ms + task.output_transfer_ms
     
-    # 2. Extract nested CPU constraints
     cpu_millicores = float(task.cpu_profile.get("cpu_millicores", 0.0))
-    
-    # 3. Unit Conversion (Bytes -> MB)
     memory_mb = task.memory_bytes / (1024 * 1024)
     
-    # 4. Derive Throughput (if data and time are present)
     transfer_mb_s = 0.0
-    if task.network_io_bytes is not None and task_time_ms > 0:
-        # Convert bytes to MB, and ms to seconds for MB/s throughput
-        transfer_mb_s = (task.network_io_bytes / (1024 * 1024)) / (task_time_ms / 1000)
+    if task.network_io_bytes is not None:
+        raw_payload_mb = task.network_io_bytes / (1024 * 1024)
+        active_runtime_sec = max(1.0, active_network_time_ms) / 1000.0
+        transfer_mb_s = raw_payload_mb / active_runtime_sec
 
-    # --- STEP 1: RAW NORMALIZATION ---
-    cpu_ratio = cpu_millicores / worker_profile.cpu_capacity_m
-    ram_ratio = memory_mb / worker_profile.ram_capacity_mb
+    # --- STEP 1: SPATIAL COST NORMALIZATION ---
+    cpu_cost = cpu_millicores / worker_profile.cpu_capacity_m
+    ram_cost = memory_mb / worker_profile.ram_capacity_mb
     
-    # Optional Network Guard
-    network_ratio = 0.0
+    network_cost = 0.0
     if worker_profile.network_capacity_mb_s and worker_profile.network_capacity_mb_s > 0:
-        network_ratio = transfer_mb_s / worker_profile.network_capacity_mb_s
+        network_cost = transfer_mb_s / worker_profile.network_capacity_mb_s
 
-    # --- STEP 2: TIME-BASED I/O MODEL ---
-    io_cost = 0.0
-    io_time_ms = task.input_transfer_ms + task.output_transfer_ms
-    
-    # Zero-Time Guard
+    # --- STEP 2: TELEMETRY DIAGNOSTIC ---
+    io_wait_ratio = 0.0
     if task_time_ms > 0:
-        io_cost = io_time_ms / task_time_ms
+        io_wait_ratio = active_network_time_ms / task_time_ms
 
     # --- STEP 3: PURE-SPATIAL QUANTIZATION ---
-    S = (2.0 * cpu_ratio) + \
-        (1.2 * ram_ratio) + \
-        (1.4 * io_cost) + \
-        (1.3 * network_ratio)
-
-    compressed = math.log2(1 + S)
+    S = (2.0 * cpu_cost) + (1.2 * ram_cost) + (1.3 * network_cost)
+    compressed = math.log2(1.0 + S)
     resource_cost_score = math.floor(compressed * 1000)
 
-    # --- STEP 4 & 5: PRESSURE AND BOTTLENECK ---
-    resource_pressure = max(cpu_ratio, ram_ratio, io_cost, network_ratio)
-    bottleneck_risk = cpu_ratio * ram_ratio * io_cost
+    # --- STEP 4 & 5: PRESSURE AND BLENDED BOTTLENECK RISK ---
+    resource_pressure = max(cpu_cost, ram_cost, network_cost)
+    bottleneck_risk = (0.5 * cpu_cost) + (0.3 * ram_cost) + (0.2 * network_cost)
 
-    # --- STEP 6 & 7: HARD LIMITS & PACKAGING ---
+    # --- STEP 6: PACKAGING ---
     return ResourceTaskVector(
         task_id=task.id,
-        
-        # Spatial vectors
-        cpu_cost=cpu_ratio,
-        ram_cost=ram_ratio,
-        io_cost=io_cost,
-        network_cost=network_ratio,
-        
-        # Preserved temporal vectors
-        duration_ms=task.duration_ms,
-        spawn_latency_ms=task.spawn_latency_ms,
-        
-        # Analytics
+        cpu_cost=cpu_cost,
+        ram_cost=ram_cost,
+        network_cost=network_cost,
         resource_cost_score=resource_cost_score,
         resource_pressure=resource_pressure,
         bottleneck_risk=bottleneck_risk,
-        
-        # Failure bounds
-        exceeds_cpu=cpu_ratio > 1.0,
-        exceeds_ram=ram_ratio > 1.0,
-        exceeds_io=io_cost > 1.0
+        exceeds_cpu=cpu_cost > 1.0,
+        exceeds_ram=ram_cost > 1.0,
+        exceeds_network=network_cost > 1.0,
+        io_wait_ratio=io_wait_ratio
     )
+
+def compile_spatial_graph(tasks: List[TemporalTask], worker_profile: WorkerProfile) -> SpatialPipelineResult:
+    result = SpatialPipelineResult()
+    
+    for task in tasks:
+        vector = compile_resource_task_vector(task, worker_profile)
+        
+        # Immediate extraction of invalid roots
+        if vector.exceeds_cpu or vector.exceeds_ram or vector.exceeds_network:
+            result.invalid_roots.add(vector.task_id)
+        else:
+            result.feasible_vectors[vector.task_id] = vector
+            
+    return result
