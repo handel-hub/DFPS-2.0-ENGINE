@@ -40,8 +40,8 @@ class Task:
     job_score:       float      # base priority + aging from pre-processor
     pos_weight:      float      # DAG position multiplier
     solver_weight:   int   = 1  # CP‑SAT objective weight (resource‑based, independent)
-    depends_on:      list[str] = field(default_factory=list)
-    children:        list[str] = field(default_factory=list)
+    depends_on:      list[str] = field(default_factory=lambda: [])
+    children:        list[str] = field(default_factory=lambda: [])
 
     # Mutable scheduling state — not part of the identity
     _deps_remaining: int = field(default=0, init=False, repr=False)

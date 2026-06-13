@@ -422,7 +422,9 @@ class StateInterface {
         };
     }
 
-
+    iSTaskRunning(taskId){
+        this.#Register.getTask(taskId)
+    }
 
 
     // -------------------------

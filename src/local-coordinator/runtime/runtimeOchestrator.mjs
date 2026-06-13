@@ -129,23 +129,24 @@ class RuntimeOchestrator extends EventEmitter {
 	////////MAIN OCHESTRATION//////////////
 	//////////////////////////////////////
 
-	handleSchedule(){
-		const addExec = this.schedulingNum - this.#execDagMap.size
+	handleSchedule() {
+		const addExec = this.schedulingNum - this.#execDagMap.size;
 
 		if (addExec > 0) {
-			const newTask = this.#toExecDag.slice(-addExec)
-			const filteredTask = this.scan(newTask)
-			filteredTask.forEach((task)=>{
-				this.#execDagMap.set(task.taskId,task)
-			})
-
-			const newSetNum = this.#toExecDag.length - addExec
-			const newSetDag = this.#toExecDag.slice(0,newSetNum)
-			this.#toExecDag = newSetDag
+			const newTask = this.#toExecDag.slice(0, addExec);
 			
-		}
+			const filteredTask = this.scan(newTask);
+			filteredTask.forEach((task) => {
+				this.#execDagMap.set(task.taskId, task);
+			});
 
+			this.#toExecDag = this.#toExecDag.slice(addExec);
+		}
+		
 	}
+
+
+
 
 	scan(tasks = []) {
 		return tasks.filter(task => !this.failed.includes(task.jobId));
