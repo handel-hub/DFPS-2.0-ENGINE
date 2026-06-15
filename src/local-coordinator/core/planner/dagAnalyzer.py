@@ -35,15 +35,15 @@ class Task:
     ram: int
     task_type: str
     
-    # Structural Topology
+     # Structural Topology
     depends_on: List[str] = field(default_factory=lambda: [])  # Parent task_ids
     children: List[str] = field(default_factory=lambda: [])    # Child task_ids
-
 
 
 @dataclass
 class InputGraph:
     tasks: List[Task]
+
 
 # --- Output Structures ---
 
@@ -53,6 +53,7 @@ class GraphIndexes:
     parent_index: Dict[str, List[str]]
     child_index: Dict[str, List[str]]
     indegree_map: Dict[str, int]
+    descendant_counts: Dict[str, int]  # NEW: Exact unique downstream reach per node
 
 @dataclass(slots=True)
 class GraphStructure:
@@ -90,12 +91,28 @@ class RejectedJob:
 class BatchResult:
     valid_jobs: List[PlannerGraph]
     rejected_jobs: List[RejectedJob]
-    
-
 
 
 class JobAnalyzer:
     """Processes a single Job DAG into a structured PlannerGraph or rejects it."""
+
+    @staticmethod
+    def _compute_exact_descendant_counts(topological_order: List[str], child_index: Dict[str, List[str]]) -> Dict[str, int]:
+        """
+        Computes the exact number of unique downstream descendants for every node.
+        Traverses backwards (bottom-up) from leaves to roots to avoid recursion limits
+        and uses bitsets to prevent double-counting shared descendants (e.g., diamond topologies).
+        """
+        descendant_sets: Dict[str, Set[str]] = {t_id: set() for t_id in topological_order}
+        
+        for task_id in reversed(topological_order):
+            for child_id in child_index.get(task_id, []):
+                # Add immediate child
+                descendant_sets[task_id].add(child_id)
+                # Add all unique descendants the child has already accumulated
+                descendant_sets[task_id].update(descendant_sets[child_id])
+        
+        return {t_id: len(descendants) for t_id, descendants in descendant_sets.items()}
 
     @staticmethod
     def analyze(job: InputGraph) -> PlannerGraph | RejectedJob:
@@ -178,7 +195,10 @@ class JobAnalyzer:
             cycle_nodes = [t for t, deg in working_indegrees.items() if deg > 0]
             return RejectedJob(job_id, RejectReason.CYCLE_DETECTED, cycle_nodes)
 
-        # 6. Finalize Analytics & Structure
+        # 6. Precompute Exact Descendant Reachability
+        descendant_counts = JobAnalyzer._compute_exact_descendant_counts(topo_order, child_index)
+
+        # 7. Finalize Analytics & Structure
         max_depth = max(depth_map.values()) if depth_map else 0
         levels: List[List[str]] = [[] for _ in range(max_depth + 1)]
         
@@ -194,7 +214,8 @@ class JobAnalyzer:
                 task_index=task_index,
                 parent_index=parent_index,
                 child_index=child_index,
-                indegree_map=indegree_map
+                indegree_map=indegree_map,
+                descendant_counts=descendant_counts  # Outputting the precomputed values
             ),
             structure=GraphStructure(
                 topological_order=topo_order,
@@ -240,4 +261,3 @@ class PlannerBatchProcessor:
                 )
 
         return result
-    
