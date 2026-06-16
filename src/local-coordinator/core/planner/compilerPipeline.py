@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, Union
 
 # --- Imports from modular files ---
 from dagAnalyzer import (
@@ -9,7 +9,7 @@ from dagAnalyzer import (
 from resourceCost import SpatialCompiler, WorkerProfile, TemporalTask, SpatialPipelineResult
 from pruning import PruningEngine, PruningResult, FailureDiagnosticGraph
 from temporalCompiler import TemporalCompiler, TemporalGraph
-import temporalCompiler  # Required for isolated type referencing during adapter bridging
+import temporalCompiler  
 from searchSpaceReduction import WarmStartConstructor, PlanningTask as SSRPlanningTask, WarmStartScheduleItem
 
 logger = logging.getLogger("DFPSCompilerPipeline")
@@ -51,6 +51,11 @@ class DFPSCompilerPipeline:
         self.max_concurrency_lanes = max_concurrency_lanes
         self.cluster_nodes_count = cluster_nodes_count
         self.ssr_engine = WarmStartConstructor()
+        
+        # Bidirectional Plugin Registry (Pipeline-Persistent State)
+        self.plugin_forward_map: Dict[str, int] = {}
+        self.plugin_reverse_map: Dict[int, str] = {}
+        self.plugin_counter: int = 1
 
     def compile_batch(self, batch: List[InputGraph]) -> CompilerBatchResult:
         if not batch:
@@ -64,12 +69,12 @@ class DFPSCompilerPipeline:
         batch_analysis = PlannerBatchProcessor.process_batch(batch)
         
         successful_compiled_jobs: List[CompiledJobResult] = []
-        rejected_jobs_registry: List[RejectedJob] = batch_analysis.rejected_jobs.copy()
+        rejected_jobs_registry: List[RejectedJob] = list(batch_analysis.rejected_jobs)
 
         # ---------------------------------------------------------
         # STAGE 2: Flattened Global Spatial Profiling
         # ---------------------------------------------------------
-        all_valid_tasks = []
+        all_valid_tasks: List[Any] = []
         for job_graph in batch_analysis.valid_jobs:
             all_valid_tasks.extend(job_graph.tasks)
 
@@ -110,17 +115,33 @@ class DFPSCompilerPipeline:
                     rejected_jobs_registry.append(RejectedJob(job_id, RejectReason.ORPHAN_TASK, ["All_Tasks_Pruned"]))
                     continue
 
+                # --- STAGE 3.5: Bidirectional Plugin Indexing ---
+                for task_id in healed_planner_graph.structure.topological_order:
+                    raw_task = healed_planner_graph.indexes.task_index[task_id]
+                    plugin_str: Union[str, int] = raw_task.plugin_id
+                    
+                    # Ensure we are evaluating a string to avoid re-indexing integers if re-run
+                    if not isinstance(plugin_str, int):
+                        plugin_str_val = str(plugin_str)
+                        # Lazy Registration
+                        if plugin_str_val not in self.plugin_forward_map:
+                            self.plugin_forward_map[plugin_str_val] = self.plugin_counter
+                            self.plugin_reverse_map[self.plugin_counter] = plugin_str_val
+                            self.plugin_counter += 1
+                        
+                        # Store the mapping ID (keep as string representation)
+                        raw_task.plugin_id = str(self.plugin_forward_map[plugin_str_val])
+
                 # --- STAGE 4: Temporal Compilation (Bridging the Contract Gap) ---
                 temporal_input = self._adapt_to_temporal_graph(healed_planner_graph)
                 temporal_graph: TemporalGraph = TemporalCompiler.compile(temporal_input)
 
                 # --- STAGE 5: Search Space Reduction (Warm-Start) ---
                 ssr_input_tasks = self._map_to_ssr_tasks(healed_planner_graph, temporal_graph, spatial_result)
-                warm_start_schedule = self.ssr_engine.generate_schedule(
+                warm_start_schedule: List[WarmStartScheduleItem] = self.ssr_engine.generate_schedule(
                     tasks=ssr_input_tasks,
                     original_cp_duration=temporal_graph.metadata.critical_path_duration_ms,
-                    max_lanes=self.max_concurrency_lanes,
-                    cluster_nodes_count=self.cluster_nodes_count
+                    max_lanes=self.max_concurrency_lanes
                 )
 
                 # --- COMMIT PIPELINE SUCCESS ---
@@ -151,24 +172,27 @@ class DFPSCompilerPipeline:
     # Private Adapters (The Glue Logic)
     # ==========================================
 
-    def _map_to_spatial_tasks(self, tasks: list) -> List[TemporalTask]:
+    def _map_to_spatial_tasks(self, tasks: List[Any]) -> List[TemporalTask]:
         """Safely extracts physical telemetry, mapping network_io_bytes to prevent blindspots."""
-        return [
-            TemporalTask(
-                id=t.task_id,
-                cpu_profile={"cpu_millicores": t.cpu},
-                memory_bytes=t.ram * 1024 * 1024, 
-                duration_ms=t.duration_ms,
-                spawn_latency_ms=t.spawn_latency_ms,
-                input_transfer_ms=t.input_transfer_ms,
-                output_transfer_ms=t.output_transfer_ms,
-                network_io_bytes=getattr(t, "network_io_bytes", None)
-            ) for t in tasks
-        ]
+        spatial_tasks: List[TemporalTask] = []
+        for t in tasks:
+            spatial_tasks.append(
+                TemporalTask(
+                    id=t.task_id,
+                    cpu_profile={"cpu_millicores": t.cpu},
+                    memory_bytes=t.ram * 1024 * 1024, 
+                    duration_ms=t.duration_ms,
+                    spawn_latency_ms=t.spawn_latency_ms,
+                    input_transfer_ms=t.input_transfer_ms,
+                    output_transfer_ms=t.output_transfer_ms,
+                    network_io_bytes=getattr(t, "network_io_bytes", None)
+                )
+            )
+        return spatial_tasks
 
     def _adapt_to_temporal_graph(self, analyzer_graph: AnalyzerPlannerGraph) -> temporalCompiler.PlannerGraph:
         """Bridges the type discrepancy between Stage 1's mutable graph and Stage 4's frozen map contract."""
-        tasks_dict = {}
+        tasks_dict: Dict[Any, temporalCompiler.InputTaskNode] = {}
         for t in analyzer_graph.tasks:
             tasks_dict[t.task_id] = temporalCompiler.InputTaskNode(
                 task_id=t.task_id,
@@ -192,13 +216,13 @@ class DFPSCompilerPipeline:
         spatial_result: SpatialPipelineResult
     ) -> List[SSRPlanningTask]:
         """Synthesizes unified PlanningTask including topological depth and io ratio."""
-        ssr_tasks = []
+        ssr_tasks: List[SSRPlanningTask] = []
         for task_id in healed_graph.structure.topological_order:
             raw_task = healed_graph.indexes.task_index[task_id]
             temp_task = temporal_graph.tasks[task_id]
             spatial_vec = spatial_result.feasible_vectors.get(task_id)
 
-            ssr_tasks.append(SSRPlanningTask(
+            ssr_task = SSRPlanningTask(
                 task_id=task_id,
                 depends_on=raw_task.depends_on,
                 children=raw_task.children,
@@ -212,6 +236,7 @@ class DFPSCompilerPipeline:
                 cpu_ratio=spatial_vec.cpu_cost if spatial_vec else 0.0,
                 ram_ratio=spatial_vec.ram_cost if spatial_vec else 0.0,
                 net_ratio=spatial_vec.network_cost if spatial_vec else 0.0
-            ))
+            )
+            ssr_tasks.append(ssr_task)
             
         return ssr_tasks
