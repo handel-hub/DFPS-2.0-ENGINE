@@ -186,7 +186,7 @@ class PruningEngine:
         if not surviving_tasks_input:
             execution_dag = PlannerGraph(
                 tasks=[],
-                indexes=GraphIndexes(task_index={}, parent_index={}, child_index={}, indegree_map={}),
+                indexes=GraphIndexes(task_index={}, parent_index={}, child_index={}, indegree_map={}, descendant_counts={}),
                 structure=GraphStructure(topological_order=[], levels=[]),
                 statistics=GraphStatistics(node_count=0, edge_count=0, max_depth=0, root_nodes=[], leaf_nodes=[]),
                 validation=GraphValidation(is_valid=True, errors=[])
