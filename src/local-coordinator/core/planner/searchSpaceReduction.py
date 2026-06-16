@@ -62,7 +62,6 @@ class ReadyQueueBuilder:
                 self.ready_tasks.add(child_id)
 
     def has_pending_tasks(self) -> bool:
-        # Fixed from the TS version to properly evaluate remaining queue state
         return len(self.ready_tasks) > 0
 
 # ==========================================
@@ -71,7 +70,6 @@ class ReadyQueueBuilder:
 
 class PriorityEngine:
     def __init__(self, tasks: List[PlanningTask], original_cp_duration: int):
-        # Math max defaulting to 1 to prevent division by zero edge cases
         self.max_children = max((len(t.children) for t in tasks), default=1)
         self.max_descendants = max((t.descendant_count for t in tasks), default=1)
         self.max_slack = max((t.slack_ms for t in tasks), default=1)
@@ -80,24 +78,17 @@ class PriorityEngine:
         self.max_descendants = max(1, self.max_descendants)
         self.max_slack = max(1, self.max_slack)
         
-        self.original_critical_path_duration = original_cp_duration
+        self.original_critical_path_duration = max(1, original_cp_duration)
 
         # Sigmoid parameters
         self.steepness_k = 10.0
         self.crossover_center = 0.5
 
-    def rank_tasks(self, ready_tasks: List[PlanningTask], remaining_cp_duration: int) -> List[PlanningTask]:
-        cp_remaining_ratio = remaining_cp_duration / max(1, self.original_critical_path_duration)
-        execution_progress = 1.0 - cp_remaining_ratio
-        
-        # Dynamic Weighting via Sigmoid
-        weight_criticality = 1.0 / (1.0 + math.exp(-self.steepness_k * (execution_progress - self.crossover_center)))
-        weight_parallelism = 1.0 - weight_criticality
-
+    def rank_tasks(self, ready_tasks: List[PlanningTask], wp: float, wc: float) -> List[PlanningTask]:
         # Sort dynamically: highest priority first
         return sorted(
             ready_tasks,
-            key=lambda t: self.calculate_priority(t, weight_parallelism, weight_criticality),
+            key=lambda t: self.calculate_priority(t, wp, wc),
             reverse=True
         )
 
@@ -129,7 +120,7 @@ class RiskEngine:
         net_square = task.net_ratio ** 2
         
         weighted_sum = (self.weight_ram * ram_square) + (self.weight_cpu * cpu_square) + (self.weight_net * net_square)
-        return math.sqrt(weighted_sum) # Already normalized 0.0 to 1.0
+        return math.sqrt(weighted_sum) 
 
 # ==========================================
 # 5. The Concurrency Placement Layer (Sweep-Line)
@@ -147,7 +138,7 @@ class ResourceCalendarSimulator:
         self.events: List[CalendarEvent] = [CalendarEvent(time_ms=0, cpu_delta=0.0, ram_delta=0.0)]
 
     def place_task(self, task: PlanningTask, t_deps: int) -> Tuple[int, int]:
-        # 1. Sweep-line validation for resource constraints (Abstracted to t_deps logic)
+        # 1. Sweep-line validation for resource constraints
         proposed_start = self.find_earliest_safe_window(t_deps, task)
 
         # 2. Find the earliest available lane at the safe time
@@ -164,8 +155,50 @@ class ResourceCalendarSimulator:
         return proposed_start, assigned_lane
 
     def find_earliest_safe_window(self, t_deps: int, task: PlanningTask) -> int:
-        # Sweep-line logic placeholder. Assuming infinite cluster capacity for now.
-        return t_deps
+        running_cpu = 0.0
+        running_ram = 0.0
+        
+        # Fast-forward to t_deps to establish baseline resource state
+        current_idx = 0
+        while current_idx < len(self.events) and self.events[current_idx].time_ms <= t_deps:
+            running_cpu += self.events[current_idx].cpu_delta
+            running_ram += self.events[current_idx].ram_delta
+            current_idx += 1
+            
+        proposed_start = max(t_deps, self.events[current_idx - 1].time_ms if current_idx > 0 else 0)
+
+        # Sweep forward to find a contiguous block of safe capacity
+        while current_idx < len(self.events):
+            if running_cpu + task.cpu_ratio <= 1.0 and running_ram + task.ram_ratio <= 1.0:
+                # Resources are currently safe. Check if they remain safe for the entire duration.
+                window_safe = True
+                peek_cpu = running_cpu
+                peek_ram = running_ram
+                
+                for peek_idx in range(current_idx, len(self.events)):
+                    if self.events[peek_idx].time_ms >= proposed_start + task.duration_ms:
+                        break # The window lasted for the entire duration without a breach
+                        
+                    peek_cpu += self.events[peek_idx].cpu_delta
+                    peek_ram += self.events[peek_idx].ram_delta
+                    
+                    if peek_cpu + task.cpu_ratio > 1.0 or peek_ram + task.ram_ratio > 1.0:
+                        window_safe = False
+                        proposed_start = self.events[peek_idx].time_ms # Jump to conflict point
+                        break
+                        
+                if window_safe:
+                    return proposed_start
+            else:
+                proposed_start = self.events[current_idx].time_ms
+
+            # Advance the sweep-line state
+            running_cpu += self.events[current_idx].cpu_delta
+            running_ram += self.events[current_idx].ram_delta
+            current_idx += 1
+
+        # If we exhausted the event timeline, it is completely safe from the last event onward
+        return max(proposed_start, self.events[-1].time_ms if self.events else 0)
 
     def register_resource_events(self, start_ms: int, duration_ms: int, cpu: float, ram: float) -> None:
         self.events.append(CalendarEvent(time_ms=start_ms, cpu_delta=cpu, ram_delta=ram))
@@ -185,24 +218,23 @@ class WarmStartConstructor:
         
         schedule: List[WarmStartScheduleItem] = []
         task_completion_times: Dict[str, int] = {}
+        
+        # Initialize dynamic weights
         remaining_cp_duration = original_cp_duration
+        cp_remaining_ratio = remaining_cp_duration / priority_engine.original_critical_path_duration
+        execution_progress = 1.0 - cp_remaining_ratio
+        weight_criticality = 1.0 / (1.0 + math.exp(-priority_engine.steepness_k * (execution_progress - priority_engine.crossover_center)))
+        weight_parallelism = 1.0 - weight_criticality
 
         while queue.has_pending_tasks():
             ready_tasks = queue.get_ready_tasks()
             
             # Stage 4.1: Rank
-            ranked_tasks = priority_engine.rank_tasks(ready_tasks, remaining_cp_duration)
-            selected_task = ranked_tasks[0] # Pull top priority
+            ranked_tasks = priority_engine.rank_tasks(ready_tasks, weight_parallelism, weight_criticality)
+            selected_task = ranked_tasks[0]
 
             # Stage 4.2: Risk Analysis
             risk = risk_engine.calculate_risk(selected_task)
-            
-            # Recalculate weights strictly for accurate output logging 
-            cp_remaining_ratio = remaining_cp_duration / max(1, original_cp_duration)
-            execution_progress = 1.0 - cp_remaining_ratio
-            weight_criticality = 1.0 / (1.0 + math.exp(-priority_engine.steepness_k * (execution_progress - priority_engine.crossover_center)))
-            weight_parallelism = 1.0 - weight_criticality
-            
             priority = priority_engine.calculate_priority(selected_task, weight_parallelism, weight_criticality)
 
             # Stage 4.3: Temporal Alignment (T_deps)
@@ -217,12 +249,18 @@ class WarmStartConstructor:
             # Update states
             task_completion_times[selected_task.task_id] = finish_ms
             queue.resolve_task(selected_task.task_id)
+            
+            # Recalculate weights ONLY if the critical path progressed
             if selected_task.is_critical_path:
                 remaining_cp_duration -= selected_task.duration_ms
+                cp_remaining_ratio = remaining_cp_duration / priority_engine.original_critical_path_duration
+                execution_progress = 1.0 - cp_remaining_ratio
+                weight_criticality = 1.0 / (1.0 + math.exp(-priority_engine.steepness_k * (execution_progress - priority_engine.crossover_center)))
+                weight_parallelism = 1.0 - weight_criticality
 
             # Output Generation
             delay_ms = start_ms - t_deps
-            confidence = max(0.0, 1.0 - (delay_ms / 5000.0)) # Decay heuristic
+            confidence = max(0.0, 1.0 - (delay_ms / 5000.0))
 
             schedule.append(WarmStartScheduleItem(
                 task_id=selected_task.task_id,
@@ -234,5 +272,9 @@ class WarmStartConstructor:
                 placement_delay_ms=delay_ms,
                 placement_confidence=confidence
             ))
+
+        # Cycle Validation Guard
+        if len(schedule) != len(tasks):
+            raise ValueError(f"Dependency cycle detected! Scheduled {len(schedule)} out of {len(tasks)} tasks.")
 
         return schedule
