@@ -225,7 +225,7 @@ class DFPSCompilerPipeline:
             ssr_task = SSRPlanningTask(
                 task_id=task_id,
                 depends_on=raw_task.depends_on,
-                children=raw_task.children,
+                children=healed_graph.indexes.child_index.get(task_id, []),
                 duration_ms=raw_task.duration_ms,
                 slack_ms=temp_task.slack_ms,
                 influence_score=temp_task.graph_influence_score,
