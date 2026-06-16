@@ -18,10 +18,12 @@ class PlanningTask:
     slack_ms: int
     influence_score: float
     is_critical_path: bool
-    descendant_count: int  # Precomputed reach
-    cpu_ratio: float       # 0.0 to 1.0
-    ram_ratio: float       # 0.0 to 1.0
-    net_ratio: float       # 0.0 to 1.0
+    descendant_count: int    # Precomputed reach
+    topological_depth: int   # Added for tie-breaking
+    io_wait_ratio: float     # Added for transient network risk profiling
+    cpu_ratio: float         # 0.0 to 1.0
+    ram_ratio: float         # 0.0 to 1.0
+    net_ratio: float         # 0.0 to 1.0
 
 @dataclass(slots=True)
 class WarmStartScheduleItem:
@@ -85,12 +87,14 @@ class PriorityEngine:
         self.crossover_center = 0.5
 
     def rank_tasks(self, ready_tasks: List[PlanningTask], wp: float, wc: float) -> List[PlanningTask]:
-        # Sort dynamically: highest priority first
-        return sorted(
-            ready_tasks,
-            key=lambda t: self.calculate_priority(t, wp, wc),
-            reverse=True
-        )
+        # Stable sort cascading: 
+        # 1. Alphanumeric fallback (Ascending)
+        ready_tasks.sort(key=lambda t: t.task_id)
+        # 2. Topological depth (Descending - prioritize deeper graph exploration)
+        ready_tasks.sort(key=lambda t: t.topological_depth, reverse=True)
+        # 3. Primary Priority Score (Descending)
+        ready_tasks.sort(key=lambda t: self.calculate_priority(t, wp, wc), reverse=True)
+        return ready_tasks
 
     def calculate_priority(self, task: PlanningTask, wp: float, wc: float) -> float:
         unlock_score = len(task.children) / self.max_children
@@ -117,7 +121,13 @@ class RiskEngine:
     def calculate_risk(self, task: PlanningTask) -> float:
         ram_square = task.ram_ratio ** 2
         cpu_square = task.cpu_ratio ** 2
-        net_square = task.net_ratio ** 2
+        
+        # Transient fix: Scale the pure network ratio by how much time the task actually spends doing I/O
+        #net_square = task.net_ratio ** 2
+
+
+        effective_net_ratio = task.net_ratio * task.io_wait_ratio
+        net_square = effective_net_ratio ** 2
         
         weighted_sum = (self.weight_ram * ram_square) + (self.weight_cpu * cpu_square) + (self.weight_net * net_square)
         return math.sqrt(weighted_sum) 
@@ -167,7 +177,7 @@ class ResourceCalendarSimulator:
             
         proposed_start = max(t_deps, self.events[current_idx - 1].time_ms if current_idx > 0 else 0)
 
-        # Sweep forward to find a contiguous block of safe capacity
+        # Sweep forward to find a contiguous block of safe capacity (Capped strictly at 1.0)
         while current_idx < len(self.events):
             if running_cpu + task.cpu_ratio <= 1.0 and running_ram + task.ram_ratio <= 1.0:
                 # Resources are currently safe. Check if they remain safe for the entire duration.
