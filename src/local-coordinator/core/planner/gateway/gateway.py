@@ -5,7 +5,7 @@ from typing import Dict, Any
 from abc import ABC, abstractmethod
 from .communication.stdin_reader import StdinReader
 from .communication.stdout_writer import StdoutWriter
-from .communication.stderr_logger import StderrLogger
+from ..diagnostics.stderr_logger import StderrLogger
 
 class App(ABC):
     @abstractmethod
