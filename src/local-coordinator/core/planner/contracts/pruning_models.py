@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Dict, Set, Union, Optional
+from typing import List, Dict, Union, Optional
 from .errors import RejectionType
 from .spatial_models import ResourceTaskVector
 from .dag_models import PlannerGraph, RejectedJob

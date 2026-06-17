@@ -1,5 +1,5 @@
 import sys
-from typing import BinaryIO, Any
+from typing import BinaryIO
 
 class StdoutWriter:
     """

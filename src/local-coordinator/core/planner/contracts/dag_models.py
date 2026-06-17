@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Dict, Set, Tuple
+from typing import List, Dict
 from .errors import RejectReason
 
 @dataclass(slots=True)

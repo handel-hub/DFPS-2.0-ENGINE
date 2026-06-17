@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Dict, Any, Union
+from typing import List, Dict
 
 @dataclass(slots=True)
 class WarmStartInfo:

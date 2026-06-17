@@ -1,5 +1,5 @@
 import sys
-from typing import Iterator, Optional, BinaryIO
+from typing import Iterator,BinaryIO
 
 class StdinReader:
     """

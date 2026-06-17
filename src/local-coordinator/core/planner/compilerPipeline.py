@@ -21,7 +21,7 @@ from stages.temporal_compiler import TemporalCompiler
 
 from stages.search_space_reduction import WarmStartConstructor
 
-import logging
+
 logger = logging.getLogger("DFPSCompilerPipeline")
 
 
