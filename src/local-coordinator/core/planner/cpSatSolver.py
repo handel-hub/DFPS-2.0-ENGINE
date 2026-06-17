@@ -172,7 +172,6 @@ class CPSatSolver:
     ) -> Union[OptimizedSchedule, WarmStartFallback, SolverFailureArtifact]:
         bundle = self._build_model(model_input)
 
-        # FIX: Type as Any to bypass Pylance's incomplete OR-Tools stubs
         solver: Any = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = self.max_solve_time_s
 
@@ -182,7 +181,6 @@ class CPSatSolver:
             f"| time_limit={self.max_solve_time_s}s"
         )
 
-        # FIX: Explicit int cast resolves the "Unknown | int" dictionary key warning
         status: int       = int(solver.Solve(bundle.model))
         status_str: str   = _STATUS_MAP.get(status, "UNKNOWN")
         wall_time_ms: int = int(float(solver.WallTime()) * 1000)
@@ -228,7 +226,7 @@ class CPSatSolver:
         )
 
     def _build_model(self, model_input: CPSatModelInput) -> _ModelBundle:
-        # FIX: Type as Any to bypass strict attribute checks for OR-Tools methods
+
         model: Any = cp_model.CpModel()
         task_count = model_input.task_count
         horizon    = model_input.horizon_ms
@@ -251,7 +249,6 @@ class CPSatSolver:
             # Clamp to valid range (latest_start could exceed horizon in degenerate cases)
             start_ub = max(start_lb, start_ub)
 
-            # FIX: Explicitly type the generated variables as Any
             start_var: Any    = model.NewIntVar(start_lb, start_ub, f's_{i}')
             finish_var: Any   = model.NewIntVar(start_lb + duration, start_ub + duration, f'f_{i}')
             interval_var: Any = model.NewIntervalVar(start_var, duration, finish_var, f'iv_{i}')
@@ -312,7 +309,7 @@ class CPSatSolver:
         # ---------------------------------------------------------
         # PHASE 5: Makespan Objective
         # ---------------------------------------------------------
-        # FIX: Explicitly type the makespan variable as Any
+
         makespan_var: Any = model.NewIntVar(0, horizon, 'makespan')
         for i in range(task_count):
             model.Add(makespan_var >= finish_vars[i])
