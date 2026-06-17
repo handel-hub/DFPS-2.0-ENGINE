@@ -2,61 +2,27 @@ import logging
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Any
 
-from dagAnalyzer import (
-    PlannerBatchProcessor, InputGraph, PlannerGraph as AnalyzerPlannerGraph,
+from contracts.dag_models import (
+    InputGraph, PlannerGraph as AnalyzerPlannerGraph,
     RejectedJob, RejectReason
 )
-from resourceCost import SpatialCompiler, WorkerProfile, TemporalTask, SpatialPipelineResult
-from pruning import PruningEngine, PruningResult, FailureDiagnosticGraph
-from temporalCompiler import TemporalCompiler, TemporalGraph
-import temporalCompiler
-from searchSpaceReduction import WarmStartConstructor, PlanningTask as SSRPlanningTask, WarmStartScheduleItem
+from contracts.spatial_models import WorkerProfile, TemporalTask, SpatialPipelineResult
+from contracts.pruning_models import PruningResult, FailureDiagnosticGraph
+from contracts.temporal_models import TemporalGraph, InputTaskNode, PlannerGraph as TemporalPlannerGraph
+from contracts.warmstart_models import PlanningTask as SSRPlanningTask, WarmStartScheduleItem
+from contracts.pipeline_models import (
+    JobDiagnostics, WarmStartSchedule, PipelineJobArtifact, CompilerBatchResult
+)
 
+from stages.dag_analyzer import PlannerBatchProcessor
+from stages.spatial_compiler import SpatialCompiler
+from stages.pruning_engine import PruningEngine
+from stages.temporal_compiler import TemporalCompiler
+
+from stages.search_space_reduction import WarmStartConstructor
+
+import logging
 logger = logging.getLogger("DFPSCompilerPipeline")
-
-
-# ============================================================
-# OUTPUT CONTRACTS
-# ============================================================
-
-@dataclass(slots=True)
-class JobDiagnostics:
-    job_id: str
-    total_tasks_submitted: int
-    total_tasks_survived: int
-    pruning_applied: bool = False
-    pruning_diagnostics: Optional[FailureDiagnosticGraph] = None
-
-
-@dataclass(slots=True)
-class WarmStartSchedule:
-    job_id: str
-    items: List[WarmStartScheduleItem]
-    final_makespan_ms: int
-    final_parallelism_weight: float  # TODO: expose from WarmStartConstructor; 0.0 until then
-
-
-@dataclass(slots=True)
-class PipelineJobArtifact:
-    """
-    Post-pruning, post-analysis canonical artifact for a single job.
-    This is the sole input surface for the CPSatBuilder.
-    """
-    job_id: str
-    healed_graph: AnalyzerPlannerGraph
-    temporal_graph: TemporalGraph
-    warm_start_schedule: WarmStartSchedule
-    diagnostics: JobDiagnostics
-
-
-@dataclass
-class CompilerBatchResult:
-    jobs: List[PipelineJobArtifact]
-    spatial_result: SpatialPipelineResult
-    rejected_jobs: List[RejectedJob]
-    total_submitted_jobs: int
-    total_successful_jobs: int
-    total_rejected_jobs: int
 
 
 # ============================================================
@@ -196,9 +162,9 @@ class DFPSCompilerPipeline:
             for t in tasks
         ]
 
-    def _adapt_to_temporal_graph(self, analyzer_graph: AnalyzerPlannerGraph) -> temporalCompiler.PlannerGraph:
-        tasks_dict: Dict[str, temporalCompiler.InputTaskNode] = {
-            t.task_id: temporalCompiler.InputTaskNode(
+    def _adapt_to_temporal_graph(self, analyzer_graph: AnalyzerPlannerGraph) -> TemporalPlannerGraph:
+        tasks_dict: Dict[str, InputTaskNode] = {
+            t.task_id: InputTaskNode(
                 task_id=t.task_id,
                 spawn_latency_ms=t.spawn_latency_ms,
                 input_transfer_ms=t.input_transfer_ms,
@@ -208,7 +174,7 @@ class DFPSCompilerPipeline:
             for t in analyzer_graph.tasks
         }
 
-        return temporalCompiler.PlannerGraph(
+        return TemporalPlannerGraph(
             tasks=tasks_dict,
             topological_order=analyzer_graph.structure.topological_order,
             children_map=analyzer_graph.indexes.child_index,
