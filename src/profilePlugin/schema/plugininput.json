@@ -1,0 +1,56 @@
+{
+  "plugins": [
+    {
+      "pluginId": "image-processor",
+      "version": "1.2.0",
+      "pluginName": "Core Image Processor",
+      "pluginType": "Transform",
+      "description": "Applies filters and formats to image assets.",
+      "permissions": {
+        "fs": {
+          "read": ["/data/input"],
+          "write": ["/data/output"]
+        },
+        "network": {
+          "send": false,
+          "receive": false
+        }
+      },
+      "execution": {
+        "entry": "index.js",
+        "cwd": "/opt/plugins/img-proc"
+      },
+      "spawnPolicy": {
+        "runtime": "node",
+        "entryPoint": "index.js",
+        "inputDirectory": "{input}",
+        "outputDirectory": "{output}",
+        "parameters": [
+          { "key": "quality", "value": "85" }
+        ]
+      },
+      "compatibility": {
+        "outputs": [
+          {
+            "extension": ".png",
+            "consumers": ["report-generator", "archive-tool"]
+          }
+        ]
+      },
+      "extensions": {
+        ".png": {
+          "execution": {
+            "entry": "png-processor.js",
+            "cwd": "/opt/plugins/img-proc"
+          }
+        },
+        ".jpg": {
+          "execution": {
+            "entry": "jpg-processor.js",
+            "cwd": "/opt/plugins/img-proc"
+          }
+        }
+      }
+    }
+  ]
+}

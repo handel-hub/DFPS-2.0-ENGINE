@@ -1,162 +1,130 @@
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import ProcessPoolOrchestrator from "./processPoolOrchestrator.mjs";
+import { ProcessPoolOrchestrator } from "../core/pool-manager/index.mjs";
 
-class LocalNodeDispatcher {
+class TaskDispatcher extends EventEmitter {
     #ppo;
-    #pluginRegistry; 
+    #pluginRegistry;
     
-    // Core State Maps
-    #jobQueue;       
-    #activeJobs;     
-    #workerJobMap;   
-    
-    // Background Engines
-    #drainInterval;
+    // Local State Ledgers
+    #activeTasks;     // Map<taskId, { workerId, status, pluginId, jobPayload }>
+    #workerTaskMap;   // Map<workerId, taskId> reverse lookup
+
+    // Self-Healing Timers
     #reaperInterval;
-    #reconInterval;  
-    
-    // External Egress Callback
-    #onTelemetry;
+    #reconInterval;
 
-    constructor(config = {}, pluginDefinitions = {}, onTelemetryCallback) {
-        this.#pluginRegistry = pluginDefinitions; 
-        this.#jobQueue = [];
-        this.#activeJobs = new Map();
-        this.#workerJobMap = new Map();
+    constructor(config = {}, pluginDefinitions = {}) {
+        super();
+        this.#pluginRegistry = pluginDefinitions;
+        this.#activeTasks = new Map();
+        this.#workerTaskMap = new Map();
 
-        if (typeof onTelemetryCallback !== "function") {
-            throw new Error("[Dispatcher] Must provide an onTelemetry callback for external routing.");
-        }
-        this.#onTelemetry = onTelemetryCallback;
+        this.config = {
+            maxSilenceMs: Number(config.maxSilenceMs ?? 30000),
+            reaperTickMs: Number(config.reaperTickMs ?? 15000),
+            reconTickMs: Number(config.reconTickMs ?? 45000)
+        };
 
+        // Initialize PPO and route all its noise through our translator
         this.#ppo = new ProcessPoolOrchestrator(config, (e) => this.#routePPOEvent(e));
 
-        // 1. The Queue Engine (e.g., every 2s)
-        this.#drainInterval = setInterval(() => this.#drainQueue(), Number(config.queueTickMs ?? 2000));
-        
-        // 2. The Sliding Window Zombie Reaper (e.g., every 15s)
-        this.#reaperInterval = setInterval(
-            () => this.#reapZombies(config.maxSilenceMs ?? 30_000), 
-            Number(config.reaperTickMs ?? 15_000)
-        );
-
-        // 3. The State Reconciler (e.g., every 45s)
-        this.#reconInterval = setInterval(() => this.#reconcileState(), Number(config.reconTickMs ?? 45_000));
+        // Start local hardware protection loops
+        this.#reaperInterval = setInterval(() => this.#reapZombies(), this.config.reaperTickMs);
+        this.#reconInterval = setInterval(() => this.#reconcileState(), this.config.reconTickMs);
     }
 
     // ===================================================================
-    // PUBLIC API: INGRESS & EGRESS
+    // DOWNWARD API: RTM TO DISPATCHER (CONTROL PLANE)
     // ===================================================================
     
     dispatchJob(jobPayload) {
         const { taskId, pluginId, filePath } = jobPayload;
         
         if (!this.#pluginRegistry[pluginId]) {
-            throw new Error(`[Dispatcher] Unknown pluginId: ${pluginId}`);
+            this.emit("TASK_FAILED", { taskId, reason: "UNKNOWN_PLUGIN" });
+            return;
         }
 
-        this.#activeJobs.set(taskId, {
-            ...jobPayload,
-            status: "QUEUED",
-            attempts: 0,
-            queuedAt: Date.now()
-        });
+        const pluginDef = this.#pluginRegistry[pluginId];
+        const snapshot = {
+            total_memory_mb: os.totalmem() / (1024 * 1024),
+            mem_available_mb: os.freemem() / (1024 * 1024)
+        };
 
-        this.#jobQueue.push(taskId);
-        this.#drainQueue(); 
-        return taskId;
+        const ppoTask = {
+            taskId,
+            pluginId,
+            filePath,
+            memoryProfile: pluginDef.memoryProfile,
+            memorySnapshot: snapshot,
+            caller: "TaskDispatcher"
+        };
+
+        this.#activeTasks.set(taskId, { status: "INITIATING", pluginId, jobPayload });
+        const result = this.#ppo.runTask(ppoTask);
+
+        if (result === "REJECTED") {
+            this.#cleanupLocalLedger(taskId);
+        }
     }
 
-    releaseWorker(workerId, reason = "COMPLETED") {
-        const taskId = this.#workerJobMap.get(workerId);
+    resolveTask(taskId) {
+        const taskRecord = this.#activeTasks.get(taskId);
+        if (!taskRecord || !taskRecord.workerId) return;
+
+        const workerId = taskRecord.workerId;
         
-        if (taskId) {
-            const job = this.#activeJobs.get(taskId);
-            if (job) job.status = reason;
-            this.#activeJobs.delete(taskId);
-            this.#workerJobMap.delete(workerId);
+        try {
+            this.#ppo.completeTask(workerId); // Frees the PPO slot
+        } catch (err) {
+            console.warn(`[Dispatcher] Failed to cleanly resolve worker ${workerId}:`, err);
         }
 
-        // Return the slot to the orchestrator
-        try { this.#ppo.completeTask(workerId); } catch (_) {}
-        
-        // A slot just freed up. Feed the next job instantly.
-        this.#drainQueue(); 
+        this.#cleanupLocalLedger(taskId, workerId);
+        // The PPO will emit WORKER_IDLE, which triggers #broadcastCapacity()
+    }
+
+    abortTask(taskId, reason = "RTM_ABORT") {
+        const taskRecord = this.#activeTasks.get(taskId);
+        if (!taskRecord || !taskRecord.workerId) {
+            this.#cleanupLocalLedger(taskId);
+            return;
+        }
+
+        const workerId = taskRecord.workerId;
+
+        try {
+            this.#ppo.evictWorker(workerId, reason);
+        } catch (err) {
+            console.warn(`[Dispatcher] Failed to evict worker ${workerId}:`, err);
+        }
+
+        this.#cleanupLocalLedger(taskId, workerId);
     }
 
     // ===================================================================
-    // THE ENGINE: ATOMIC MEMORY QUEUE DRAINING
-    // ===================================================================
-    
-    #drainQueue() {
-        if (this.#jobQueue.length === 0) return;
-
-        const currentQueue = [...this.#jobQueue];
-
-        // Capture OS memory ONCE at the top of the tick
-        let availableMemoryMB = os.freemem() / (1024 * 1024);
-        const totalMemoryMB = os.totalmem() / (1024 * 1024);
-
-        for (let i = 0; i < currentQueue.length; i++) {
-            const taskId = currentQueue[i];
-            const job = this.#activeJobs.get(taskId);
-            
-            if (!job || job.status !== "QUEUED") continue;
-
-            const pluginDef = this.#pluginRegistry[job.pluginId];
-            const requiredRam = pluginDef.memoryProfile.fullRequiredMB ?? 0;
-
-            // Defensive JIT Snapshot using our locally tracked, loop-safe variable
-            const snapshot = {
-                total_memory_mb: totalMemoryMB,
-                mem_available_mb: availableMemoryMB
-            };
-
-            const ppoTask = {
-                taskId: job.taskId,
-                pluginId: job.pluginId,
-                filePath: job.filePath,
-                memoryProfile: pluginDef.memoryProfile,
-                memorySnapshot: snapshot,
-                caller: "LocalDispatcher"
-            };
-
-            const result = this.#ppo.runTask(ppoTask);
-
-            if (result === "ACCEPTED") {
-                this.#jobQueue = this.#jobQueue.filter(id => id !== taskId);
-                job.status = "DISPATCHING"; 
-                
-                availableMemoryMB -= requiredRam;
-            }
-        }
-    }
-
-    // ===================================================================
-    // EVENT ROUTER: THE MISSING LINK HOOKS
+    // UPWARD API: EVENT TRANSLATION MATRIX
     // ===================================================================
 
     #routePPOEvent(event) {
-        const { type, pluginId, workerId, taskId, slotId, data, err } = event;
-
-        const capacityFreedEvents = ["WORKER_IDLE", "WORKER_READY", "WORKER_WARM_READY", "WORKER_DEAD", "WORKER_CRASHED", "WORKER_EVICTED"];
-        if (capacityFreedEvents.includes(type)) {
-            setImmediate(() => this.#drainQueue());
-        }
+        const { type, pluginId, workerId, taskId, slotId, data, err, reason } = event;
 
         switch (type) {
-            // --- 1. OPAQUE TELEMETRY
-            case "RUNTIME_UPDATE":
-            case "RAW_LOG":
-            case "STDERR_LOG":
-                if (!workerId) return;
-                
-                const linkedTaskId = this.#workerJobMap.get(workerId);
-                this.#onTelemetry({ taskId: linkedTaskId, workerId, type, payload: data || err });
+            // --- CATEGORY A: CAPACITY & PROVISIONING ---
+            case "WORKER_READY":
+            case "WORKER_WARM_READY":
+            case "WORKER_PROMOTED":
+            case "WORKER_IDLE":
+                this.#broadcastCapacity();
                 break;
 
-            // --- 2. SPAWN HANDSHAKE ---
+            case "WORKER_SPAWN_REJECTED_MEMORY":
+            case "WORKER_SPAWN_REJECTED_NO_SLOT":
+                this.emit("CAPACITY_EXHAUSTED", { reason: type, pluginId });
+                break;
+
             case "NEED_PLUGIN_INSTANCE":
                 const pDef = this.#pluginRegistry[pluginId];
                 this.#ppo.ensurePluginReady(pluginId, {
@@ -165,158 +133,188 @@ class LocalNodeDispatcher {
                         mem_available_mb: os.freemem() / (1024 * 1024)
                     },
                     base_overhead_mb: pDef.memoryProfile.baseOverheadMB,
-                    caller: "LocalDispatcher"
+                    caller: "TaskDispatcher"
                 });
                 break;
 
             case "WORKER_SLOT_CLAIMED":
                 const newWorkerId = `wkr_${pluginId}_${randomUUID().split('-')[0]}`;
-                const pluginData = {
+                this.#ppo.bindWorkerToSlot(newWorkerId, slotId, {
                     pluginId,
                     cmd: this.#pluginRegistry[pluginId].cmd,
                     args: this.#pluginRegistry[pluginId].args,
                     initTimeout: this.#pluginRegistry[pluginId].initTimeout
-                };
-
-                const bindResult = this.#ppo.bindWorkerToSlot(newWorkerId, slotId, pluginData, "LocalDispatcher");
-                if (bindResult === "REJECTED") {
-                    console.warn(`[Dispatcher] Slot bind rejected for ${slotId}. Temp key expired or collision.`);
-                }
+                }, "TaskDispatcher");
                 break;
 
-            // --- 3. IPC ASSIGNMENT ---
+            case "WORKER_DEAD":
+            case "WORKER_EVICTED":
+            case "WORKER_CLOSED_CLEAN":
+                this.#broadcastCapacity();
+                break;
+
+            // --- CATEGORY B: TASK LIFECYCLE ---
             case "WORKER_ASSIGNED":
                 this.#executeIpcPayload(workerId, taskId);
                 break;
 
-            // --- 4. FAILURE RECOVERY ---
+            case "WORKER_SEND_SUCCESS":
+                const activeTaskId = taskId || this.#workerTaskMap.get(workerId);
+                if (activeTaskId && this.#activeTasks.has(activeTaskId)) {
+                    this.#activeTasks.get(activeTaskId).status = "RUNNING";
+                    this.emit("TASK_ACCEPTED", { taskId: activeTaskId, workerId });
+                }
+                break;
+
+            case "WORKER_UPDATE":
+                // Pure Relay: Dispatcher does not parse or judge this payload.
+                const linkedTaskId = this.#workerTaskMap.get(workerId);
+                if (linkedTaskId) {
+                    this.emit("TASK_UPDATE", { taskId: linkedTaskId, workerId, payload: data });
+                }
+                break;
+
+            // --- CATEGORY C: TASK FAILURES ---
+            case "WORKER_REJECTED_MEMORY":
+            case "WORKER_SEND_REJECTED_STATE":
+                this.#failTask(taskId, type, reason);
+                break;
+
             case "WORKER_SEND_FAILED":
-                this.#requeueTask(taskId, "IPC_SEND_FAILURE");
+            case "WORKER_SEND_ABORTED_STATE_CHANGE":
+                const failedTaskId = taskId || this.#workerTaskMap.get(workerId);
+                this.#failTask(failedTaskId, type, err);
                 try { this.#ppo.evictWorker(workerId, "SEND_FAILED_CLEANUP"); } catch(_) {}
                 break;
 
             case "WORKER_CRASHED":
-            case "WORKER_DEAD":
-            case "WORKER_RUNTIME_ERROR":
             case "WORKER_OS_ERROR":
-                const activeTaskId = this.#workerJobMap.get(workerId);
-                if (activeTaskId) {
-                    this.#requeueTask(activeTaskId, `WORKER_DIED: ${type}`);
-                    this.#workerJobMap.delete(workerId);
+            case "WORKER_RUNTIME_ERROR":
+            case "WORKER_COMM_ERROR":
+            case "WORKER_SPAWN_TIMEOUT":
+            case "WORKER_SPAWN_STATE_ERROR":
+                const crashedTaskId = this.#workerTaskMap.get(workerId);
+                if (crashedTaskId) {
+                    this.#failTask(crashedTaskId, `FATAL_CRASH: ${type}`, err || reason);
                 }
+                break;
+
+            // --- CATEGORY D: TELEMETRY & ADMINISTRATION ---
+            case "RAW_LOG":
+            case "STDERR_LOG":
+                if (!workerId) return;
+                const logTaskId = this.#workerTaskMap.get(workerId);
+                this.emit("TELEMETRY_STREAM", { taskId: logTaskId, workerId, type, payload: data || err });
+                break;
+
+            case "WORKER_RESOURCE_ERROR":
+            case "RECONCILE_REPORT":
+            case "WORKER_KILLALL_ERROR":
+                this.emit("NODE_CRITICAL_ERROR", { type, payload: err || data });
                 break;
         }
     }
 
     // ===================================================================
-    // IPC EXECUTION & SAFETY NETS
+    // SELF-HEALING MECHANISMS
+    // ===================================================================
+
+    #reapZombies() {
+        if (typeof this.#ppo.register?.getStalledWorkers !== "function") return;
+
+        const zombies = this.#ppo.register.getStalledWorkers(this.config.maxSilenceMs) || [];
+        
+        for (const zombie of zombies) {
+            if (!zombie || !zombie.workerId) continue;
+            
+            console.error(`[Dispatcher] Hardware Watchdog: Worker ${zombie.workerId} flatlined. Evicting.`);
+            
+            const taskId = this.#workerTaskMap.get(zombie.workerId);
+            if (taskId) {
+                this.#failTask(taskId, "WORKER_SILENCE_TIMEOUT", `Worker silent for > ${this.config.maxSilenceMs}ms`);
+            }
+            
+            try {
+                this.#ppo.evictWorker(zombie.workerId, "SILENCE_TIMEOUT");
+            } catch (_) {}
+        }
+    }
+
+    #reconcileState() {
+        for (const [workerId, taskId] of this.#workerTaskMap.entries()) {
+            const worker = this.#ppo.register?.getWorker(workerId);
+            
+            // If the PPO doesn't know about it, or it's not BUSY, but we think it's running a task:
+            if (!worker || worker.state === "DEAD" || worker.state === "IDLE" || worker.state === "TERMINATING") {
+                console.warn(`[Dispatcher] State Desync: Worker ${workerId} is ${worker?.state || 'MISSING'}, but ledger maps to ${taskId}. Healing.`);
+                this.#failTask(taskId, "STATE_DESYNC_HEALED", `PPO reported state: ${worker?.state || 'MISSING'}`);
+            }
+        }
+    }
+
+    // ===================================================================
+    // INTERNAL MECHANICS
     // ===================================================================
 
     async #executeIpcPayload(workerId, taskId) {
-        const job = this.#activeJobs.get(taskId);
-        if (!job) return;
+        const taskRecord = this.#activeTasks.get(taskId);
+        if (!taskRecord) return;
 
-        job.status = "RUNNING";
-        job.workerId = workerId;
-        job.attempts += 1;
-        this.#workerJobMap.set(workerId, taskId);
+        taskRecord.workerId = workerId;
+        this.#workerTaskMap.set(workerId, taskId);
 
-        // Tell PPO to mark state as BUSY and start the heartbeat timer
         this.#ppo.assignTask(workerId, { taskId, assignedAt: Date.now() });
 
         try {
             await this.#ppo.send(workerId, {
                 action: "PROCESS_FILE",
-                taskId: job.taskId,
-                filePath: job.filePath,
-                parameters: job.parameters || {}
+                taskId: taskId,
+                filePath: taskRecord.jobPayload.filePath,
+                parameters: taskRecord.jobPayload.parameters || {}
             });
         } catch (err) {
-            // Rejection handled by WORKER_SEND_FAILED in router
+            // Handled by WORKER_SEND_FAILED in router
         }
     }
 
-    #requeueTask(taskId, reason) {
-        const job = this.#activeJobs.get(taskId);
-        if (!job) return;
-
-        console.warn(`[Dispatcher] Requeueing task ${taskId}. Reason: ${reason}`);
+    #failTask(taskId, reasonCode, details) {
+        if (!taskId || !this.#activeTasks.has(taskId)) return;
         
-        if (job.attempts >= 3) {
-            job.status = "FAILED_PERMANENTLY";
-            this.#onTelemetry({ taskId, workerId: job.workerId, type: "SYSTEM_FAILURE", payload: reason });
-            return;
-        }
-
-        job.status = "QUEUED";
-        job.workerId = null;
-        this.#jobQueue.push(taskId);
-    }
-
-    // ===================================================================
-    // SELF-HEALING: REAPERS & RECONCILIATION
-    // ===================================================================
-
-    #reapZombies(maxSilenceMs) {
-        // Find processes stuck in a while(true) loop that stopped logging
-        const zombies = this.#ppo.register?.getStalledWorkers(maxSilenceMs) || [];
+        const workerId = this.#activeTasks.get(taskId).workerId;
         
-        for (const zombie of zombies) {
-            console.error(`[CRITICAL] Worker ${zombie.workerId} flatlined (silence > ${maxSilenceMs}ms). Evicting.`);
-            
-            const activeTaskId = this.#workerJobMap.get(zombie.workerId);
-            if (activeTaskId) {
-                this.#requeueTask(activeTaskId, "WORKER_SILENCE_TIMEOUT");
-                this.#workerJobMap.delete(zombie.workerId);
-            }
-            
-            // Forcibly unbind it from the compute pool
-            this.#ppo.evictWorker(zombie.workerId, "SILENCE_TIMEOUT");
+        this.emit("TASK_FAILED", { taskId, reason: reasonCode, details: details || "No details provided" });
+        this.#cleanupLocalLedger(taskId, workerId);
+    }
+
+    #cleanupLocalLedger(taskId, workerId) {
+        this.#activeTasks.delete(taskId);
+        if (workerId) {
+            this.#workerTaskMap.delete(workerId);
         }
     }
 
-    #reconcileState() {
-
+    #broadcastCapacity() {
         try {
-            const ppoState = this.#ppo.queryPool().register; // Assuming this returns { IDLE: X, BUSY: Y, ... }
-            const activeWorkers = this.#ppo.register?.getStateCounts() || {};
-            
-            for (const [workerId, taskId] of this.#workerJobMap.entries()) {
-                const w = this.#ppo.register?.getWorker(workerId);
-                
-                if (!w || w.state === "DEAD" || w.state === "IDLE") {
-                    console.warn(`[Dispatcher] State Desync: Dispatcher thinks ${workerId} is RUNNING, but PPO says ${w?.state || 'MISSING'}. Healing.`);
-                    this.#requeueTask(taskId, "STATE_DESYNC_HEALED");
-                    this.#workerJobMap.delete(workerId);
-                }
+            const counts = this.#ppo.queryPool().register;
+            const idleCount = counts["IDLE"] || 0;
+            const warmCount = counts["WARM"] || 0;
+            const totalAvailable = idleCount + warmCount;
+
+            if (totalAvailable > 0) {
+                this.emit("CAPACITY_AVAILABLE", { idleCount: totalAvailable });
             }
         } catch (err) {
-            console.error("[Dispatcher] Recon tick failed:", err);
+            console.error("[TaskDispatcher] Failed to poll capacity:", err);
         }
     }
 
-    // ===================================================================
-    // GRACEFUL SHUTDOWN
-    // ===================================================================
-
-    async shutdown() {
-        console.log("[Dispatcher] Initiating graceful shutdown. Halting queue ingress.");
-        clearInterval(this.#drainInterval);
+    shutdown() {
         clearInterval(this.#reaperInterval);
         clearInterval(this.#reconInterval);
-        
-        return new Promise((resolve) => {
-            const checkEmpty = setInterval(() => {
-                if (this.#workerJobMap.size === 0) {
-                    clearInterval(checkEmpty);
-                    this.#ppo.killAll();
-                    this.#ppo.unmonitorAll();
-                    console.log("[Dispatcher] Shutdown complete.");
-                    resolve();
-                }
-            }, 1000);
-        });
+        this.#ppo.killAll();
+        this.#ppo.unmonitorAll();
+        this.removeAllListeners();
     }
 }
 
-export default LocalNodeDispatcher;
+export default TaskDispatcher;

@@ -123,6 +123,8 @@ class JobStateRegistry {
                 retries: 0,
                 assignedWorker: stage.assignedWorker ?? null,
                 startedAt: null,
+                updatedAt: null,
+                runtimePhase:null,
                 completedAt: null,
                 lastError: null,
                 dependencies: new Set(deps),
@@ -207,6 +209,7 @@ class JobStateRegistry {
             retries: t.retries,
             assignedWorker: t.assignedWorker,
             startedAt: t.startedAt,
+            updatedAt: t.updatedAt,
             completedAt: t.completedAt,
             lastError: t.lastError,
             dependencies: Array.from(t.dependencies),
@@ -374,7 +377,21 @@ class JobStateRegistry {
         job.status = this.#deriveJobStatus(job);
         return this.getTask(taskId);
     }
+    updateRuntimePhase(taskId,phase,metadata = {}){
+        const entry = this.#taskIndex.get(taskId);
+        if (!entry) throw new Error(`task ${taskId} not found`);
+        const job = this.#jobs.get(entry.jobId);
+        const t = entry.task;
 
+        t.runtimePhase = phase;
+        t.updatedAt = this.#now();
+        job.updatedAt = this.#now();
+        const pp = t.metadata.progress
+        t.metadata.progress = metadata.progress?? pp
+
+        this.#appendChange('TASK_UPDATE', job.jobId, taskId, { runtimePhase: phase, });
+
+    }
     markTaskCompleted(taskId) {
         const entry = this.#taskIndex.get(taskId);
         if (!entry) throw new Error(`task ${taskId} not found`);

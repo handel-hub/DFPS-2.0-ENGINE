@@ -1,0 +1,109 @@
+PROCESS POOL OCHESTRATOR EMITTED EVENTS
+"WORKER_REJECTED_MEMORY"
+"WORKER_ASSIGNED"
+"NEED_PLUGIN_INSTANCE"
+"WORKER_READY"
+"WORKER_WARM_READY"
+"WORKER_PROMOTED"
+"WORKER_SPAWN_REJECTED_MEMORY"
+"WORKER_SPAWN_REJECTED_NO_SLOT"
+"WORKER_SLOT_CLAIMED"
+"WORKER_SLOT_BIND_FAILED"
+"WORKER_SPAWN_FAILED"
+"WORKER_SPAWN_INITIATED"
+"WORKER_DRAINING"
+"WORKER_EVICTED"
+"WORKER_RESOURCE_ERROR"
+"WORKER_SEND_REJECTED_STATE"
+"WORKER_SEND_SUCCESS"
+"WORKER_SEND_RETRY"
+"WORKER_SEND_FAILED"
+"WORKER_SEND_ABORTED_STATE_CHANGE"
+"WORKER_KILLALL_INITIATED"
+"WORKER_KILLALL_ERROR"
+"WORKER_UNMONITOR_ALL"
+"WORKER_UNMONITOR_ERROR"
+"SPAWN_RACE_DISCARDED"
+"WORKER_WARM_READY"
+"WORKER_SPAWN_STATE_ERROR"
+"WORKER_SPAWN_TIMEOUT"
+"WORKER_UPDATE"
+"WORKER_RUNTIME_ERROR"
+"WORKER_OS_ERROR"
+"WORKER_COMM_ERROR"
+"WORKER_CLOSED_CLEAN"
+"WORKER_CRASHED"
+"WORKER_LOG"
+"WORKER_SLOT_CLAIM_EXPIRED"
+"WORKER_DEAD"
+"WORKER_IDLE"
+"RECONCILE_REPORT"
+
+
+
+This is a highly granular observability footprint. When developing a robust distributed job orchestration engine, organizing these telemetry events provides a clear map of the system's operational domains.
+
+By analyzing the `ProcessPoolOrchestrator` alongside the underlying `SlotManager`, `MemoryController`, `WorkerActions`, and `Register`, these 39 events naturally fall into five distinct architectural categories.
+
+### 1. Process Lifecycle & Execution State
+
+These events track the healthy, expected operational phases of a worker process, from its initial creation to its clean termination. They are critical for monitoring worker utilization and cold-start latency.
+
+* **NEED_PLUGIN_INSTANCE:** Signals that a task was accepted, but no idle workers are available, requiring a new spawn.
+* **WORKER_SPAWN_INITIATED:** The orchestrator has successfully bound a slot and instructed the OS to fork the process.
+* **WORKER_READY:** A newly spawned worker has fully initialized and transitioned to an active state.
+* **WORKER_WARM_READY:** A pre-warmed standby worker is available for immediate use.
+* **WORKER_PROMOTED:** A warm worker has been successfully moved into the active worker pool to handle a task.
+* **WORKER_ASSIGNED:** A task has been successfully routed to an idle worker.
+* **WORKER_IDLE:** A worker has completed its task and is waiting for new work.
+* **WORKER_CLOSED_CLEAN:** A process exited intentionally with a standard `0` exit code.
+* **WORKER_DEAD:** The final lifecycle state after a worker is fully cleaned up and purged from the registry.
+
+### 2. Resource Allocation & Admission Control
+
+These events expose the system's defensive mechanisms. They track how the `MemoryController` and `SlotManager` protect the host from resource exhaustion and concurrency races.
+
+* **WORKER_SLOT_CLAIMED:** A temporary concurrency lock (`tempKey`) was acquired to begin the spawning sequence.
+* **WORKER_SLOT_CLAIM_EXPIRED:** The spawn sequence took too long, and the temporary slot lock was automatically released.
+* **WORKER_SPAWN_REJECTED_NO_SLOT:** The system is at maximum process capacity; no worker or warm slots are available.
+* **WORKER_SPAWN_REJECTED_MEMORY:** The `MemoryController` blocked a new process because spawning it would breach the safety margin.
+* **WORKER_REJECTED_MEMORY:** The `MemoryController` blocked a specific task execution because the combined spawn and operational overhead exceeds available memory.
+* **WORKER_SLOT_BIND_FAILED:** A race condition or registry failure occurred when trying to convert a temporary slot claim into a permanent worker record.
+
+### 3. Inter-Process Communication (IPC)
+
+These events map the reliability of asynchronous message passing between the Node.js coordinator and the underlying child processes.
+
+* **WORKER_SEND_SUCCESS:** A payload was successfully written to the worker's standard input stream.
+* **WORKER_SEND_RETRY:** A message delivery failed, triggering the orchestrator's built-in delay and retry backoff loop.
+* **WORKER_SEND_FAILED:** A message exhausted all delivery attempts and was ultimately dropped.
+* **WORKER_SEND_REJECTED_STATE:** The orchestrator blocked a transmission because the target worker was not in an allowed state (e.g., trying to send data to a `TERMINATING` worker).
+* **WORKER_SEND_ABORTED_STATE_CHANGE:** During a retry loop, the target worker unexpectedly changed states, forcing the orchestrator to abandon the message.
+
+### 4. Fault Tolerance & System Anomalies
+
+This category represents the engine's error-handling boundaries. These events fire when processes misbehave, the OS throws an error, or internal state invariants are violated.
+
+* **WORKER_SPAWN_FAILED:** The OS failed to create the child process outright.
+* **WORKER_SPAWN_TIMEOUT:** The child process was created but failed to initialize within the strict `initTimeout` window, resulting in a SIGKILL.
+* **SPAWN_RACE_DISCARDED:** A process successfully spawned, but the orchestrator had already moved on (e.g., due to a timeout), so the late process is discarded.
+* **WORKER_SPAWN_STATE_ERROR:** The registry failed to mark a newly spawned worker as ready, triggering a forced cleanup.
+* **WORKER_RUNTIME_ERROR:** The child process emitted structured JSON error data through its `stderr` stream.
+* **WORKER_OS_ERROR:** A system-level error occurred (e.g., broken pipes, missing executables).
+* **WORKER_COMM_ERROR:** A fatal failure occurred on the communication streams (like an `EPIPE` error on `stdin`).
+* **WORKER_CRASHED:** A process terminated unexpectedly with a non-zero exit code or was killed by an OS signal.
+* **RECONCILE_REPORT:** The internal health check detected a mismatch between the physical slot counts and the logical registry counts.
+
+### 5. Administrative Actions & Telemetry
+
+These events involve manual interventions, pool-wide administrative commands, and the raw data outputs generated by the active plugins.
+
+* **WORKER_DRAINING:** A graceful shutdown was initiated for a specific worker, allowing it to finish its current routine.
+* **WORKER_EVICTED:** A worker was forcefully terminated by an administrative command (`SIGKILL`).
+* **WORKER_KILLALL_INITIATED:** A global command was issued to tear down the entire active worker pool.
+* **WORKER_KILLALL_ERROR:** An error occurred while attempting a pool-wide teardown.
+* **WORKER_UNMONITOR_ALL:** The `pidusage` telemetry polling was globally suspended.
+* **WORKER_UNMONITOR_ERROR:** An issue occurred while trying to clear the telemetry polling timers.
+* **WORKER_RESOURCE_ERROR:** The orchestrator failed to fetch OS-level CPU/Memory metrics for the requested workers.
+* **WORKER_UPDATE:** A worker emitted structured JSON telemetry data through its `stdout` stream.
+* **WORKER_LOG:** A worker emitted unstructured, raw string data through its standard streams.
