@@ -1,0 +1,18 @@
+file size 
+context
+
+for cpu
+avgCpu
+peakCpu
+
+for io
+s_in
+s_out
+
+for memory
+peak rambytes
+file size
+
+time
+spawn ms
+actual duration

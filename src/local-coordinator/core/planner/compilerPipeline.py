@@ -11,10 +11,12 @@ from contracts.pruning_models import PruningResult, FailureDiagnosticGraph
 from contracts.temporal_models import TemporalGraph, InputTaskNode, PlannerGraph as TemporalPlannerGraph
 from contracts.warmstart_models import PlanningTask as SSRPlanningTask, WarmStartScheduleItem
 from contracts.pipeline_models import (
-    JobDiagnostics, WarmStartSchedule, PipelineJobArtifact, CompilerBatchResult
+    JobDiagnostics, WarmStartSchedule, PipelineJobArtifact, CompilerBatchResult,
+    BatchTiming, BatchDiagnosticReport
 )
+import time
 
-from stages.dag_analyzer import PlannerBatchProcessor
+from stages.dag_analyzer import PlannerBatchProcessor, JobAnalyzer
 from stages.spatial_compiler import SpatialCompiler
 from stages.pruning_engine import PruningEngine
 from stages.temporal_compiler import TemporalCompiler
@@ -34,16 +36,23 @@ class DFPSCompilerPipeline:
         self.worker_profile = worker_profile
         self.max_concurrency_lanes = max_concurrency_lanes
         self.ssr_engine = WarmStartConstructor()
+        
+        # Inject structural analyzer required for Pruning engine healing
+        PruningEngine.inject_analyzer(JobAnalyzer.analyze)
 
     def compile_batch(self, batch: List[InputGraph]) -> CompilerBatchResult:
+        t_start = time.perf_counter()
         if not batch:
+            empty_timing = BatchTiming(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            empty_diag = BatchDiagnosticReport(empty_timing, 0, 0.0)
             return CompilerBatchResult(
                 jobs=[],
                 spatial_result=SpatialPipelineResult(),
                 rejected_jobs=[],
                 total_submitted_jobs=0,
                 total_successful_jobs=0,
-                total_rejected_jobs=0
+                total_rejected_jobs=0,
+                batch_diagnostics=empty_diag
             )
 
         logger.info(f"Initiating compilation pipeline for batch of {len(batch)} jobs.")
@@ -51,7 +60,9 @@ class DFPSCompilerPipeline:
         # ---------------------------------------------------------
         # STAGE 1: Structural Batch Analysis
         # ---------------------------------------------------------
+        t0 = time.perf_counter()
         batch_analysis = PlannerBatchProcessor.process_batch(batch)
+        dag_analysis_ms = (time.perf_counter() - t0) * 1000.0
 
         job_artifacts: List[PipelineJobArtifact] = []
         rejected_jobs_registry: List[RejectedJob] = list(batch_analysis.rejected_jobs)
@@ -65,11 +76,18 @@ class DFPSCompilerPipeline:
 
         logger.info("Executing flattened spatial compilation across batch.")
         spatial_input = self._map_to_spatial_tasks(all_valid_tasks)
+        
+        t0 = time.perf_counter()
         spatial_result: SpatialPipelineResult = SpatialCompiler.compile(spatial_input, self.worker_profile)
+        spatial_compilation_ms = (time.perf_counter() - t0) * 1000.0
 
         # ---------------------------------------------------------
         # STAGES 3-5: Per-Job Topology Pipeline
         # ---------------------------------------------------------
+        total_pruning_ms = 0.0
+        total_temporal_ms = 0.0
+        total_ssr_ms = 0.0
+        
         for base_planner_graph in batch_analysis.valid_jobs:
             job_id = base_planner_graph.tasks[0].job_id
             diagnostics = JobDiagnostics(
@@ -80,7 +98,9 @@ class DFPSCompilerPipeline:
 
             try:
                 # --- STAGE 3: Surgical Pruning ---
+                t0 = time.perf_counter()
                 pruning_result: PruningResult = PruningEngine.prune(base_planner_graph, spatial_result)
+                total_pruning_ms += (time.perf_counter() - t0) * 1000.0
 
                 diagnostics.pruning_applied = pruning_result.failure_diagnostics.statistics.pruned_count > 0
                 diagnostics.pruning_diagnostics = pruning_result.failure_diagnostics
@@ -101,16 +121,20 @@ class DFPSCompilerPipeline:
                     continue
 
                 # --- STAGE 4: Temporal Compilation ---
+                t0 = time.perf_counter()
                 temporal_input = self._adapt_to_temporal_graph(healed_planner_graph)
                 temporal_graph: TemporalGraph = TemporalCompiler.compile(temporal_input)
+                total_temporal_ms += (time.perf_counter() - t0) * 1000.0
 
                 # --- STAGE 5: Search Space Reduction (Warm-Start) ---
+                t0 = time.perf_counter()
                 ssr_input_tasks = self._map_to_ssr_tasks(healed_planner_graph, temporal_graph, spatial_result)
                 warm_start_items: List[WarmStartScheduleItem] = self.ssr_engine.generate_schedule(
                     tasks=ssr_input_tasks,
                     original_cp_duration=temporal_graph.metadata.critical_path_duration_ms,
                     max_lanes=self.max_concurrency_lanes
                 )
+                total_ssr_ms += (time.perf_counter() - t0) * 1000.0
 
                 warm_start_schedule = WarmStartSchedule(
                     job_id=job_id,
@@ -131,8 +155,32 @@ class DFPSCompilerPipeline:
             except Exception as e:
                 logger.error(f"[{job_id}] Unhandled pipeline exception: {str(e)}")
                 rejected_jobs_registry.append(
-                    RejectedJob(job_id=job_id, reason=RejectReason.ORPHAN_TASK, failed_tasks=[f"Exception: {str(e)}"])
+                    RejectedJob(job_id=job_id, reason=RejectReason.SYSTEM_FAULT, failed_tasks=[f"Exception: {str(e)}"])
                 )
+
+        total_pipeline_ms = (time.perf_counter() - t_start) * 1000.0
+        
+        pruned_tasks = sum(
+            job.diagnostics.pruning_diagnostics.statistics.pruned_count 
+            for job in job_artifacts 
+            if job.diagnostics.pruning_diagnostics
+        )
+        
+        valid_ws = [job.warm_start_schedule.final_parallelism_weight for job in job_artifacts]
+        avg_weight = sum(valid_ws) / len(valid_ws) if valid_ws else 0.0
+
+        batch_diagnostics = BatchDiagnosticReport(
+            timings=BatchTiming(
+                total_pipeline_ms=total_pipeline_ms,
+                dag_analysis_ms=dag_analysis_ms,
+                spatial_compilation_ms=spatial_compilation_ms,
+                pruning_ms=total_pruning_ms,
+                temporal_compilation_ms=total_temporal_ms,
+                search_space_reduction_ms=total_ssr_ms
+            ),
+            total_pruned_tasks=pruned_tasks,
+            average_parallelism_weight=avg_weight
+        )
 
         return CompilerBatchResult(
             jobs=job_artifacts,
@@ -140,7 +188,8 @@ class DFPSCompilerPipeline:
             rejected_jobs=rejected_jobs_registry,
             total_submitted_jobs=len(batch),
             total_successful_jobs=len(job_artifacts),
-            total_rejected_jobs=len(rejected_jobs_registry)
+            total_rejected_jobs=len(rejected_jobs_registry),
+            batch_diagnostics=batch_diagnostics
         )
 
     # ============================================================

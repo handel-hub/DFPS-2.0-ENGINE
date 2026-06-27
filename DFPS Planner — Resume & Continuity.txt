@@ -1,0 +1,630 @@
+DFPS Planner — Resume & Continuity Document (June 2026)
+
+This document is intended to serve as the single source of truth for resuming Planner work after quota limits, model switches, IDE changes, or long breaks.
+
+
+---
+
+1. Current Status
+
+Planner Refactor Status
+
+The planner migration/refactor project is largely complete.
+
+Completed
+
+✅ Contracts extraction
+
+✅ Stage isolation
+
+✅ Directory restructuring
+
+✅ DAG Analyzer migration
+
+✅ Temporal Compiler migration
+
+✅ Spatial/Resource Compiler migration
+
+✅ Pruning Engine migration
+
+✅ CP-SAT Builder migration
+
+✅ CP-SAT Solver migration
+
+✅ Diagnostics layer creation
+
+✅ Validation layer creation
+
+✅ Gateway layer creation
+
+✅ Compiler pipeline restructuring
+
+
+---
+
+Current State
+
+The system compiles structurally.
+
+The architecture exists.
+
+However, several functional integrations and refinements remain unfinished.
+
+The planner is architecturally complete but not functionally finalized.
+
+
+---
+
+2. Outstanding Planner Work
+
+These are the remaining tasks.
+
+
+---
+
+A. Pipeline Integration Review
+
+Status
+
+Partially complete.
+
+Problem
+
+The compiler pipeline currently orchestrates stages but still requires verification that every stage output is correctly consumed by the next stage.
+
+Areas needing review:
+
+DAG → Spatial
+
+DAG → Temporal
+
+Temporal → Pruning
+
+Pruning → Warm Start
+
+Warm Start → CP-SAT Builder
+
+Builder → Solver
+
+Solver → Gateway Output
+
+
+
+---
+
+Goal
+
+Verify:
+
+no missing fields
+
+no duplicate mappings
+
+no orphaned objects
+
+no broken contracts
+
+
+
+---
+
+B. Rejection Handling
+
+Status
+
+Not implemented.
+
+
+---
+
+Current pipeline assumes success.
+
+Failure paths are incomplete.
+
+
+---
+
+Required Handling
+
+DAG Rejection
+
+Examples:
+
+cycle detected
+
+missing dependency
+
+duplicate task ids
+
+malformed graph
+
+
+Output:
+
+RejectedJob
+
+
+---
+
+Resource Rejection
+
+Examples:
+
+RAM impossible
+
+CPU impossible
+
+network impossible
+
+
+Output:
+
+InvalidRoot
+
+
+---
+
+Pruning Rejection
+
+Examples:
+
+all candidates removed
+
+no feasible schedule
+
+
+Output:
+
+PruningDiagnostic
+
+
+---
+
+Solver Rejection
+
+Examples:
+
+INFEASIBLE
+
+UNKNOWN
+
+
+Output:
+
+SolverDiagnostic
+
+
+---
+
+Goal
+
+Create unified rejection flow.
+
+
+---
+
+C. Plugin Indexing Layer
+
+Status
+
+Not implemented.
+
+
+---
+
+Problem
+
+CP-SAT works best with integer identifiers.
+
+Planner still carries:
+
+plugin_id: str
+
+
+---
+
+Planned Solution
+
+Builder stage creates:
+
+plugin_index = {
+    "ffmpeg": 1,
+    "compressor": 2,
+    "hashing": 3
+}
+
+Reverse map:
+
+reverse_plugin_index = {
+    1: "ffmpeg",
+    2: "compressor",
+    3: "hashing"
+}
+
+
+---
+
+Flow
+
+Before CP-SAT:
+
+plugin_id -> plugin_index
+
+After CP-SAT:
+
+plugin_index -> plugin_id
+
+
+---
+
+Goal
+
+Keep original planner contracts unchanged.
+
+Perform indexing only at Builder boundary.
+
+
+---
+
+D. Gateway Review
+
+Status
+
+Needs review.
+
+
+---
+
+You already identified this.
+
+Gateway feels structurally correct but operationally questionable.
+
+
+---
+
+Areas to Inspect
+
+protocol.py
+
+Check:
+
+serialization
+
+deserialization
+
+error handling
+
+
+
+---
+
+stdin_reader
+
+Check:
+
+malformed payloads
+
+partial payloads
+
+empty payloads
+
+
+
+---
+
+stdout_writer
+
+Check:
+
+JSON stability
+
+large payload handling
+
+
+
+---
+
+stderr_writer
+
+Check:
+
+diagnostics separation
+
+trace output
+
+
+
+---
+
+Goal
+
+Ensure gateway behaves as a reliable compiler boundary.
+
+
+---
+
+E. End-to-End Testing
+
+Status
+
+Not completed.
+
+
+---
+
+Required test:
+
+Input DAG
+↓
+DAG Analyzer
+↓
+Spatial Compiler
+↓
+Temporal Compiler
+↓
+Pruning
+↓
+Warm Start
+↓
+Builder
+↓
+Solver
+↓
+Gateway Output
+
+
+---
+
+Goal
+
+First successful end-to-end execution.
+
+
+---
+
+3. CP-SAT Status
+
+
+---
+
+Primary Objective
+
+Minimize:
+
+Makespan
+
+Highest priority objective.
+
+
+---
+
+Secondary Objective
+
+Improve:
+
+CPU utilization
+RAM utilization
+
+without violating limits.
+
+
+---
+
+Hard Constraints
+
+CPU
+
+Must never exceed:
+
+95%
+
+
+---
+
+RAM
+
+Must never exceed:
+
+worker capacity
+
+
+---
+
+Concurrency
+
+Must never exceed:
+
+max_concurrency
+
+
+---
+
+DAG Dependencies
+
+Must always hold.
+
+
+---
+
+4. Deferred Optimization
+
+These were intentionally postponed.
+
+
+---
+
+Plugin Reuse Optimization
+
+Status:
+
+Deferred.
+
+Reason:
+
+Complexity outweighs current value.
+
+
+---
+
+Examples
+
+Reusable:
+
+Python worker
+
+WASM worker
+
+persistent plugin host
+
+
+Not reusable:
+
+ffmpeg process
+
+shell script
+
+one-shot executable
+
+
+
+---
+
+Future Goal
+
+Reduce:
+
+spawn cost
+process churn
+
+through intelligent reuse.
+
+
+---
+
+Current Decision
+
+Document only.
+
+Do not implement yet.
+
+
+---
+
+5. Planner Folder Architecture
+
+Current intended architecture:
+
+planner/
+
+├── contracts/
+│
+├── stages/
+│   ├── dag_analyzer.py
+│   ├── temporal_compiler.py
+│   ├── spatial_compiler.py
+│   ├── pruning_engine.py
+│   ├── search_space_reduction.py
+│   ├── cpsat_builder.py
+│   └── cpsat_solver.py
+│
+├── gateway/
+│
+├── diagnostics/
+│
+├── utils/
+│
+└── compiler_pipeline.py
+
+
+---
+
+6. Recommended Next Work Order
+
+When you resume:
+
+Priority 1
+
+Gateway review
+
+
+---
+
+Priority 2
+
+End-to-end pipeline validation
+
+
+---
+
+Priority 3
+
+Rejection handling
+
+
+---
+
+Priority 4
+
+Plugin indexing layer
+
+
+---
+
+Priority 5
+
+Solver refinement
+
+
+---
+
+Priority 6
+
+Plugin reuse optimization
+
+(Future)
+
+
+---
+
+7. Resume Prompt
+
+When returning later, use:
+
+Resume DFPS Planner from continuity document.
+
+Current status:
+- Refactor completed.
+- Architecture migrated.
+- CP-SAT builder and solver exist.
+- Gateway requires review.
+- Rejection handling not implemented.
+- Plugin indexing layer not implemented.
+- Need end-to-end validation of DAG → Solver pipeline.
+
+Start by auditing the current planner architecture and identify the highest-risk integration gaps before proposing code changes.
+
+
+---
+
+Final Project Position
+
+The Planner is no longer in the architecture-design phase.
+
+It is now in the integration, validation, and hardening phase.
+
+The biggest remaining risks are not algorithms—they are:
+
+1. Stage integration correctness.
+
+
+2. Gateway correctness.
+
+
+3. Failure/rejection handling.
+
+
+4. End-to-end execution validation.
+
+
+
+Everything else is refinement.

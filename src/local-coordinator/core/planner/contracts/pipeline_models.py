@@ -6,6 +6,7 @@ from .temporal_models import TemporalGraph
 from .spatial_models import SpatialPipelineResult
 from .pruning_models import FailureDiagnosticGraph
 from .warmstart_models import WarmStartScheduleItem
+from .solver_models import SolverBatchResult
 
 @dataclass(slots=True)
 class JobDiagnostics:
@@ -30,6 +31,21 @@ class PipelineJobArtifact:
     warm_start_schedule: WarmStartSchedule
     diagnostics: JobDiagnostics
 
+@dataclass(slots=True)
+class BatchTiming:
+    total_pipeline_ms: float
+    dag_analysis_ms: float
+    spatial_compilation_ms: float
+    pruning_ms: float
+    temporal_compilation_ms: float
+    search_space_reduction_ms: float
+
+@dataclass
+class BatchDiagnosticReport:
+    timings: BatchTiming
+    total_pruned_tasks: int
+    average_parallelism_weight: float
+
 @dataclass
 class CompilerBatchResult:
     jobs: List[PipelineJobArtifact]
@@ -38,3 +54,4 @@ class CompilerBatchResult:
     total_submitted_jobs: int
     total_successful_jobs: int
     total_rejected_jobs: int
+    batch_diagnostics: BatchDiagnosticReport

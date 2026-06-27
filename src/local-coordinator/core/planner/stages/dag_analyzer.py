@@ -175,7 +175,7 @@ class PlannerBatchProcessor:
                 job_id = job.tasks[0].job_id if job.tasks else "UNKNOWN"
                 logger.error(f"Critical failure parsing Job {job_id}: {str(e)}")
                 result.rejected_jobs.append(
-                    RejectedJob(job_id, RejectReason.ORPHAN_TASK, ["System_Crash"])
+                    RejectedJob(job_id, RejectReason.SYSTEM_FAULT, ["System_Crash"])
                 )
 
         return result
