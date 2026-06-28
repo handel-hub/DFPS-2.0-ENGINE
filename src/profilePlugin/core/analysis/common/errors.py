@@ -37,3 +37,11 @@ class InsufficientDataWarning(AnalysisError):
 class ZeroVarianceWarning(AnalysisError):
     """Logged when standard deviation is exactly 0.0 (identical vectors)."""
     pass
+
+class InsufficientDataWarning(AnalysisError):
+    """Logged when a cohort has N < min threshold to compute significant moments."""
+    pass
+
+class InsignificantTopologyWarning(AnalysisError):
+    """Logged when a cohort yields no significant relationships (completely disconnected graph)."""
+    pass
