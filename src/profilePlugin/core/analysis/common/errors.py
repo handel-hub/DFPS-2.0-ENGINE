@@ -29,3 +29,11 @@ class DataOrganizationError(AnalysisError):
 class HighCardinalityAnomaly(AnalysisError):
     """Raised when the number of cohorts exceeds safety thresholds, threatening memory exhaustion."""
     pass
+
+class InsufficientDataWarning(AnalysisError):
+    """Logged when a cohort has N < min threshold to compute significant moments."""
+    pass
+
+class ZeroVarianceWarning(AnalysisError):
+    """Logged when standard deviation is exactly 0.0 (identical vectors)."""
+    pass
