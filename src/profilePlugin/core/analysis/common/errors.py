@@ -45,3 +45,7 @@ class InsufficientDataWarning(AnalysisError):
 class InsignificantTopologyWarning(AnalysisError):
     """Logged when a cohort yields no significant relationships (completely disconnected graph)."""
     pass
+
+class ClassificationFailureWarning(AnalysisError):
+    """Logged when curve fitting fails to converge for a relationship (defaults to UNKNOWN)."""
+    pass
