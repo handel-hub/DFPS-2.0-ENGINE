@@ -49,3 +49,11 @@ class InsignificantTopologyWarning(AnalysisError):
 class ClassificationFailureWarning(AnalysisError):
     """Logged when curve fitting fails to converge for a relationship (defaults to UNKNOWN)."""
     pass
+
+class ArithmeticUnderflowWarning(AnalysisError):
+    """Logged when an operation results in subnormal numbers."""
+    pass
+
+class ArithmeticGuardTriggered(AnalysisError):
+    """Logged when divide-by-zero is intercepted and defaulted to zero."""
+    pass
