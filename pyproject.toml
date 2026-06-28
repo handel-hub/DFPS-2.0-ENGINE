@@ -1,0 +1,19 @@
+[project]
+name = "dfps-2-0-engine"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "handel-hub", email = "jokafor516@gmail.com" }
+]
+requires-python = "==3.14.*"
+dependencies = [
+    "numpy>=2.3.5",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "scipy>=1.15.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.25,<0.12.0"]
+build-backend = "uv_build"
