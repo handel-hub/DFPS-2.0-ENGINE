@@ -11,8 +11,8 @@
  *
  */
 
-import WAL from '../infrastructure/wal.mjs'; 
-import WorkerBatcher from '../infrastructure/workerBatcher.mjs';
+import WAL from '../../infrastructure/wal.mjs'; 
+import WorkerBatcher from '../../infrastructure/workerBatcher.mjs';
 
 const VALID_TASK_STATES = new Set(['PENDING', 'RUNNING', 'COMPLETED', 'FAILED']);
 const VALID_JOB_STATES = new Set(['PENDING', 'RUNNING', 'COMPLETED', 'FAILED']);

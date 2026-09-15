@@ -1,0 +1,21 @@
+{
+  "plugins": [
+    {
+      "pluginId": "fib_plugin",
+      "version": "1.0.0",
+      "pluginName": "Fibonacci CPU Burner",
+      "pluginType": "Test",
+      "permissions": {
+        "fs": {
+          "read": ["C:\\Users\\John\\Documents\\CODE\\back\\DFPS-2.0-ENGINE\\src\\profilePlugin\\tests\\simulation"],
+          "write": ["C:\\Users\\John\\Documents\\CODE\\back\\DFPS-2.0-ENGINE\\src\\profilePlugin\\tests\\simulation\\out"]
+        }
+      },
+      "execution": {
+        "cwd": "C:\\Users\\John\\Documents\\CODE\\back\\DFPS-2.0-ENGINE\\src\\profilePlugin\\tests\\simulation",
+        "entry": "fib_plugin.js",
+        "executable": "node"
+      }
+    }
+  ]
+}

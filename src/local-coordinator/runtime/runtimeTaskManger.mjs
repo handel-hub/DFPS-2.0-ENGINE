@@ -1,162 +1,69 @@
-import LocalNodeDispatcher from "./taskDispatcher.mjs"
+import LocalNodeDispatcher from "./taskDispatcher.mjs";
+import { LifecycleMonitor } from "./lifecycleMonitor.mjs";
 import StateInterface from "../core/state/stateInterface.mjs";
 
-//const dispatcher 
+export class RuntimeTaskManager {
+    constructor(apiFetchFunction, maxSlots = 10, sharedState = null) {
+        this.api = apiFetchFunction;
+        this.maxSlots = maxSlots;
+        this.dispatcher = new LocalNodeDispatcher();
+        this.StateInterface = sharedState || new StateInterface();
+        this.lifecycleMonitor = new LifecycleMonitor(this.dispatcher);
 
-class name {
-	#state = new Map()
-	
-	constructor(fetchFunction,hashfunction,dispatcheinstance) {
-
-		this.dispatcher = new LocalNodeDispatcher();
-		this.StateInterface = new StateInterface()
-		
-
-	}
-	update(event){
-
-	}
-
-	#schema(data){
-		const {jobId,taskId} = data
-		return {
-			jobId,
-			taskId,
-			currentState : 'PENDING',
-			startedAt : Date.now(),
-			updatedAt : null,
-			workerId : null,
-			retries : null,
-			outputHash : null,
-			metadata : data
-		}
-	}
-
-	registerTask(task){
-		const schema = this.#schema(task)
-		this.#state.set(schema.taskId,schema)
-		
-
-
-	}
-
-	analyzEvent(event){
-
-		const {
-			type,
-			pluginId, 
-			workerId, 
-			taskId, 
-			slotId, 
-			data, 
-			err 
-		} = event
-
-		switch (type) {
-			case value:
-				
-				break;
-		
-			default:
-				break;
-		}
-
-	}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-	 // ===================================================================
-    // EVENT HANDLERS (Lower Tier Translation)
-    // ===================================================================
-
-    #handleCapacity(nodeId, payload, isAvailable) {
-        const node = this.#nodes.get(nodeId);
-        if (!node) return;
-
-        if (node.status === "DRAINING" || node.status === "OFFLINE") return;
-
-        node.availableCapacity = isAvailable ? (payload.idleCount || 1) : 0;
-        
-        if (isAvailable) {
-            this.#routeTraffic();
-        }
-    }
-	#handleTaskAccepted(nodeId, payload) {
-        const { taskId } = payload;
-        const task = this.#activeTasks.get(taskId);
-        if (task && task.status === "DISPATCHING") {
-            task.status = "RUNNING";
-            this.emit("TASK_RUNNING", { taskId, nodeId });
-        }
-    }
-	#handleTaskFailed(nodeId, payload) {
-        const { taskId, reason } = payload;
-        const task = this.#activeTasks.get(taskId);
-        const node = this.#nodes.get(nodeId);
-
-        if (node) node.assignedTasks.delete(taskId);
-
-        if (!task) return;
-
-        console.warn(`[RTM] Task ${taskId} failed on ${nodeId}. Reason: ${reason}`);
-
-        if (task.attempts >= this.config.maxRetries) {
-            task.status = "DEAD_LETTER";
-            task.failedAt = Date.now();
-            task.finalReason = reason;
-            this.#deadLetterQueue.set(taskId, task);
-            this.#activeTasks.delete(taskId);
-            this.emit("TASK_DEAD_LETTER", { taskId, attempts: task.attempts, reason });
-        } else {
-            task.status = "QUEUED";
-            task.assignedNode = null;
-            task.dispatchedAt = null;
-            // Place at the front of the queue to prioritize retries
-            this.#globalQueue.unshift(taskId); 
-            this.emit("TASK_REQUEUED", { taskId, nextAttempt: task.attempts + 1 });
-            this.#routeTraffic();
-        }
-    }
-	#handleNodeFailure(nodeId, payload) {
-        const node = this.#nodes.get(nodeId);
-        if (!node || node.status === "OFFLINE") return;
-
-        console.error(`[CRITICAL] Evacuating Node ${nodeId} due to critical error:`, payload);
-        node.status = "OFFLINE";
-        node.availableCapacity = 0;
-
-        // Reclaim all tasks assigned to this node
-        for (const taskId of node.assignedTasks) {
-            this.#handleTaskFailed(nodeId, { taskId, reason: "NODE_EVACUATION" });
-        }
-
-        node.assignedTasks.clear();
-        this.emit("NODE_OFFLINE", { nodeId, reason: payload });
+        this.#initListeners();
     }
 
+    #initListeners() {
+        this.lifecycleMonitor.on("LIFECYCLE_PHASE", ({ taskId, phase }) => {
+            this.StateInterface.updateRuntimePhase(taskId, phase, {});
+        });
+
+        this.lifecycleMonitor.on("LIFECYCLE_RESULT", ({ taskId, status, metrics, artifacts, error }) => {
+            if (status === "SUCCESS") {
+                this.StateInterface.markTaskCompleted(taskId, { metrics, artifacts });
+                if (metrics) {
+                    this.StateInterface.updateProfilesSynchronous(taskId, metrics);
+                }
+            } else {
+                this.StateInterface.markTaskFailed(taskId, error);
+            }
+            this.requestWork();
+        });
+
+        this.lifecycleMonitor.on("LIFECYCLE_CRASH", ({ taskId, error }) => {
+            this.StateInterface.markTaskFailed(taskId, error);
+            this.requestWork();
+        });
+    }
+
+    availableSlots() {
+        const activeCount = this.StateInterface.getActiveTaskCount();
+        return Math.max(0, this.maxSlots - activeCount);
+    }
+
+    requestWork() {
+        if (typeof this.api !== 'function') return;
+        const needed = this.availableSlots();
+        if (needed > 0) {
+            const tasks = this.api(needed);
+            if (tasks && Array.isArray(tasks) && tasks.length > 0) {
+                console.log("[DEBUG] Tasks received:", tasks);
+                this.accept(tasks);
+            }
+        }
+    }
+
+    accept(tasks = []) {
+        for (const task of tasks) {
+            this.StateInterface.markTaskDispatched(task.taskId, task.pluginId);
+            const jobPayload = {
+                taskId: task.taskId,
+                pluginId: task.pluginId,
+                filePath: task.filePath || task.payload?.filePath,
+                parameters: task.parameters || task.payload?.parameters,
+                ignoreMemoryCheck: task.ignoreMemoryCheck || task.payload?.ignoreMemoryCheck
+            };
+            this.dispatcher.dispatchJob(jobPayload);
+        }
+    }
 }
-

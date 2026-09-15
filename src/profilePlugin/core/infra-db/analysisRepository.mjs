@@ -8,11 +8,15 @@ import { DatabaseSync } from 'node:sqlite';
  */
 export class AnalysisDatabaseManager {
     /**
-     * @param {string} dbPath - The path to the SQLite database file.
+     * @param {string|DatabaseSync} dbOrPath - The path to the SQLite database file, or a shared DatabaseSync instance.
      */
-    constructor(dbPath) {
-        this.db = new DatabaseSync(dbPath);
-        this.#enablePragmas();
+    constructor(dbOrPath) {
+        if (typeof dbOrPath === 'string') {
+            this.db = new DatabaseSync(dbOrPath);
+            this.#enablePragmas();
+        } else {
+            this.db = dbOrPath;
+        }
     }
 
     #enablePragmas() {

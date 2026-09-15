@@ -1,0 +1,19 @@
+{
+  "datasets": [
+    {
+      "datasetName": "fib_small",
+      "datasetDirectory": "C:\\Users\\John\\Documents\\CODE\\back\\DFPS-2.0-ENGINE\\src\\profilePlugin\\tests\\simulation\\datasets\\fib_small",
+      "context": ["fibonacci", "small"]
+    },
+    {
+      "datasetName": "fib_medium",
+      "datasetDirectory": "C:\\Users\\John\\Documents\\CODE\\back\\DFPS-2.0-ENGINE\\src\\profilePlugin\\tests\\simulation\\datasets\\fib_medium",
+      "context": ["fibonacci", "medium"]
+    },
+    {
+      "datasetName": "fib_large",
+      "datasetDirectory": "C:\\Users\\John\\Documents\\CODE\\back\\DFPS-2.0-ENGINE\\src\\profilePlugin\\tests\\simulation\\datasets\\fib_large",
+      "context": ["fibonacci", "large"]
+    }
+  ]
+}

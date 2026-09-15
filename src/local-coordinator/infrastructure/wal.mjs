@@ -46,6 +46,7 @@ function crc32(buf) {
 }
 
 class WAL {
+    #initPromise;
     constructor({ walDir = './wal', workerId = 'worker', walRotateBytes = 64 * 1024 * 1024 } = {}) {
         this.walDir = walDir;
         this.workerId = workerId || 'worker';

@@ -40,15 +40,20 @@ class TaskDispatcher extends EventEmitter {
     // ===================================================================
     
     dispatchJob(jobPayload) {
-        const { taskId, pluginId, filePath } = jobPayload;
+        const { taskId, pluginId, filePath, policy } = jobPayload;
         
+        if (!policy) {
+            throw new Error("MISSING_POLICY");
+        }
+
         if (!this.#pluginRegistry[pluginId]) {
             this.emit("TASK_FAILED", { taskId, reason: "UNKNOWN_PLUGIN" });
             return;
         }
 
-        const pluginDef = this.#pluginRegistry[pluginId];
-        const snapshot = {
+        this.#pluginRegistry[pluginId] = policy;
+        const pluginDef = policy;
+        const snapshot = jobPayload.ignoreMemoryCheck ? null : {
             total_memory_mb: os.totalmem() / (1024 * 1024),
             mem_available_mb: os.freemem() / (1024 * 1024)
         };
@@ -63,11 +68,18 @@ class TaskDispatcher extends EventEmitter {
         };
 
         this.#activeTasks.set(taskId, { status: "INITIATING", pluginId, jobPayload });
-        const result = this.#ppo.runTask(ppoTask);
-
-        if (result === "REJECTED") {
+        try {
+            const result = this.#ppo.runTask(ppoTask);
+            if (result === "REJECTED") {
+                this.#cleanupLocalLedger(taskId);
+                throw new Error("PPO_REJECTED");
+            }
+            return result;
+        } catch (err) {
             this.#cleanupLocalLedger(taskId);
+            throw err;
         }
+
     }
 
     resolveTask(taskId) {
@@ -127,8 +139,16 @@ class TaskDispatcher extends EventEmitter {
 
             case "NEED_PLUGIN_INSTANCE":
                 const pDef = this.#pluginRegistry[pluginId];
+                let taskIgnoreMem = false;
+                if (taskId) {
+                    const taskRec = this.#activeTasks.get(taskId);
+                    if (taskRec && taskRec.jobPayload?.ignoreMemoryCheck) {
+                        taskIgnoreMem = true;
+                    }
+                }
+                
                 this.#ppo.ensurePluginReady(pluginId, {
-                    snapshot: {
+                    snapshot: taskIgnoreMem ? null : {
                         total_memory_mb: os.totalmem() / (1024 * 1024),
                         mem_available_mb: os.freemem() / (1024 * 1024)
                     },
@@ -139,11 +159,12 @@ class TaskDispatcher extends EventEmitter {
 
             case "WORKER_SLOT_CLAIMED":
                 const newWorkerId = `wkr_${pluginId}_${randomUUID().split('-')[0]}`;
+                const pluginDef = this.#pluginRegistry[pluginId];
                 this.#ppo.bindWorkerToSlot(newWorkerId, slotId, {
                     pluginId,
-                    cmd: this.#pluginRegistry[pluginId].cmd,
-                    args: this.#pluginRegistry[pluginId].args,
-                    initTimeout: this.#pluginRegistry[pluginId].initTimeout
+                    executionPayload: pluginDef.executionPayload,
+                    envVariables: pluginDef.envVariables,
+                    initTimeout: pluginDef.initTimeout
                 }, "TaskDispatcher");
                 break;
 
@@ -256,24 +277,35 @@ class TaskDispatcher extends EventEmitter {
     // INTERNAL MECHANICS
     // ===================================================================
 
+
     async #executeIpcPayload(workerId, taskId) {
         const taskRecord = this.#activeTasks.get(taskId);
         if (!taskRecord) return;
-
+        
+        const pluginDef = this.#pluginRegistry[taskRecord.pluginId];
+        const spawnPolicy = pluginDef.spawnPolicy || {};
+        
         taskRecord.workerId = workerId;
         this.#workerTaskMap.set(workerId, taskId);
 
-        this.#ppo.assignTask(workerId, { taskId, assignedAt: Date.now() });
-
+        // PPO runTask already called assignTask, so we just send the IPC 
+        //payload now.
+        
         try {
-            await this.#ppo.send(workerId, {
+            const sendResult = await this.#ppo.send(workerId, {
                 action: "PROCESS_FILE",
                 taskId: taskId,
                 filePath: taskRecord.jobPayload.filePath,
-                parameters: taskRecord.jobPayload.parameters || {}
+                inputDirectory: spawnPolicy.inputDirectory,
+                outputDirectory: spawnPolicy.outputDirectory,
+                parameters: taskRecord.jobPayload.parameters || spawnPolicy.parameters || []
             });
+            
+            if (sendResult instanceof Error) {
+                this.#failTask(taskId, "IPC_SEND_FAILED", sendResult.message);
+            }
         } catch (err) {
-            // Handled by WORKER_SEND_FAILED in router
+            this.#failTask(taskId, "IPC_SEND_FAILED", err.message);
         }
     }
 

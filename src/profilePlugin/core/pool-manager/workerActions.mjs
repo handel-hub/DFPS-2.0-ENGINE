@@ -27,15 +27,25 @@ export class WorkerActions extends EventEmitter {
     }
 
     create(workerId, pluginData, time = { flag: false }, config = { initTimeout: 2000 }) {
-        const { pluginId, cmd, args = [] } = pluginData;
+        const { pluginId, executionPayload = {}, envVariables = {} } = pluginData;
+        const { executable, args = [], cwd } = executionPayload;
         const timeout = time.flag ? time.time : null;
 
-        const child = spawn(cmd, args, {
-            cwd: `${this.#cwd}/${pluginId}`,
-            shell: false,
-            env: { ...process.env },
-            timeout: timeout,
-        });
+        const spawnCwd = cwd || `${this.#cwd}/${pluginId}`;
+
+        let child;
+        try {
+            child = spawn(executable, args, {
+                cwd: spawnCwd,
+                shell: false,
+                env: { ...process.env, ...envVariables },
+                timeout: timeout,
+            });
+        } catch (rawErr) {
+            const err = new ProjectError(`Spawn failed synchronously (invalid cwd or executable?): ${rawErr.message}`, { workerId, code: 'SPAWN_SYNC_ERROR', cause: rawErr });
+            this.emit('update', { type: 'ERROR', workerId, err });
+            return err;
+        }
 
         if (!child.pid) {
             this.#cleanup(workerId, child);
@@ -138,6 +148,7 @@ export class WorkerActions extends EventEmitter {
                     if (!currentPids.has(trackedPid)) {
                         const lifetimeMs = now - meta.startTime;
                         treeState.descendants.delete(trackedPid);
+                        try { pidusage.unmonitor(trackedPid); } catch (_) {}
                         
                         ledger.push({
                             pid: trackedPid,
@@ -163,13 +174,13 @@ export class WorkerActions extends EventEmitter {
             // 2. Re-schedule: Only schedule the next poll if the worker still exists.
             // Update the map with the new timer ID so #cleanup() can still clear it.
             if (this.#activeProcessTree.has(workerId)) {
-                const nextTimerId = setTimeout(pollOsTree, 2000);
+                const nextTimerId = setTimeout(pollOsTree, 30000);
                 this.#discoveryTimers.set(workerId, nextTimerId);
             }
         };
 
         // Kick off the first poll and store it in existing registry
-        const initialTimerId = setTimeout(pollOsTree, 2000);
+        const initialTimerId = setTimeout(pollOsTree, 30000);
         this.#discoveryTimers.set(workerId, initialTimerId);
     }
     
@@ -383,7 +394,10 @@ export class WorkerActions extends EventEmitter {
 
             // Isolated Polling Strategy (Promise.allSettled mitigates race conditions)
             const results = await Promise.allSettled(
-                pidsToPoll.map(pid => pidusage(pid).catch(() => null)) // catch ignores disappeared PIDs
+                pidsToPoll.map(pid => Promise.race([
+                    pidusage(pid).catch(() => null),
+                    new Promise(r => setTimeout(() => r(null), 100))
+                ]))
             );
 
             let totalCpu = 0;
