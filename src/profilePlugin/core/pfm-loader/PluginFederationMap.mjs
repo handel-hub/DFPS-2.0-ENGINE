@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import parseJsonAst from 'json-to-ast';
 import { ValidationLayer } from './ValidationLayer.mjs';
 import { LinuxBwrapDriver } from './drivers/LinuxBwrapDriver.mjs';
+import { UnsandboxedDriver } from './drivers/UnsandboxedDriver.mjs';
 
 export class PluginFederationMap {
   constructor() {
@@ -18,7 +19,7 @@ export class PluginFederationMap {
     if (this.hostOs === 'linux') {
       return new LinuxBwrapDriver();
     }
-    throw new Error(`CRITICAL_BOOT_EXCEPTION: Environment mapping driver unavailable for platform target: ${this.hostOs}`);
+    return new UnsandboxedDriver();
   }
 
   deepFreeze(obj) {
@@ -28,11 +29,11 @@ export class PluginFederationMap {
         if (typeof key === 'object' && key !== null) this.deepFreeze(key);
         if (typeof value === 'object' && value !== null) this.deepFreeze(value);
       }
-      Object.freeze(obj);
       // Disable mutating methods
       obj.set = function() { throw new Error("Cannot mutate frozen Map"); };
       obj.delete = function() { throw new Error("Cannot mutate frozen Map"); };
       obj.clear = function() { throw new Error("Cannot mutate frozen Map"); };
+      Object.freeze(obj);
       return obj;
     }
 
@@ -130,6 +131,8 @@ export class PluginFederationMap {
           outputs: Array.isArray(rawPluginData.compatibility.outputs) ? rawPluginData.compatibility.outputs : []
         } : null;
 
+        const memoryProfile = rawPluginData.memoryProfile || { baseOverheadMB: 50 };
+
         // Build base default execution configuration mapping
         const defaultTranslation = this.driver.translate(rawPluginData);
         this.warnings.push(...defaultTranslation.warnings);
@@ -144,7 +147,8 @@ export class PluginFederationMap {
           envVariables: defaultTranslation.envVariables,
           pluginMetadata,
           spawnPolicy,
-          compatibility
+          compatibility,
+          memoryProfile
         };
 
         extensionMap.set("__default__", baseRuntimePolicy);
@@ -175,7 +179,8 @@ export class PluginFederationMap {
                 envVariables: overrideTranslation.envVariables,
                 pluginMetadata,
                 spawnPolicy,
-                compatibility
+                compatibility,
+                memoryProfile
               };
 
               extensionMap.set(ext, specializedRuntimePolicy);

@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from "node:crypto";
 
 /**
  * ProfilingRepository handles all data access for the Profiling and Analytics subsystem.
@@ -7,11 +8,15 @@ import { DatabaseSync } from 'node:sqlite';
  */
 export class ProfilingRepository {
     /**
-     * @param {string} dbPath - The path to the SQLite database file.
+     * @param {string|DatabaseSync} dbOrPath - The path to the SQLite database file, or a shared DatabaseSync instance.
      */
-    constructor(dbPath) {
-        this.db = new DatabaseSync(dbPath);
-        this.#enablePragmas();
+    constructor(dbOrPath) {
+        if (typeof dbOrPath === 'string') {
+            this.db = new DatabaseSync(dbOrPath);
+            this.#enablePragmas();
+        } else {
+            this.db = dbOrPath;
+        }
     }
 
     #enablePragmas() {
@@ -81,6 +86,19 @@ export class ProfilingRepository {
         return stmt.all();
     }
 
+    upsertPlugin(pluginId, pluginName, pluginType, description) {
+        if (!pluginId || !pluginName) throw new Error("pluginId and pluginName are required.");
+        const stmt = this.db.prepare(`
+            INSERT INTO plugins (plugin_id, plugin_name, plugin_type, description)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(plugin_id) DO UPDATE SET
+                plugin_name = excluded.plugin_name,
+                plugin_type = excluded.plugin_type,
+                description = excluded.description
+        `);
+        return stmt.run(pluginId, pluginName, pluginType || null, description || null);
+    }
+
     // =====================================================
     // PLUGIN VERSION METHODS
     // =====================================================
@@ -106,6 +124,17 @@ export class ProfilingRepository {
     deletePluginVersion(versionId) {
         const stmt = this.db.prepare(`DELETE FROM plugin_versions WHERE version_id = ?`);
         return stmt.run(versionId);
+    }
+
+    upsertPluginVersion(versionId, pluginId, version, executablePath, outputExtension) {
+        const stmt = this.db.prepare(`
+            INSERT INTO plugin_versions (version_id, plugin_id, version, executable_path, output_extension)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(version_id) DO UPDATE SET
+                executable_path = excluded.executable_path,
+                output_extension = excluded.output_extension
+        `);
+        return stmt.run(versionId, pluginId, version, executablePath, outputExtension || null);
     }
 
     // =====================================================
@@ -156,6 +185,19 @@ export class ProfilingRepository {
         return stmt.all();
     }
 
+    upsertDataset(datasetId, datasetName, datasetDirectory, context1, context2) {
+        const stmt = this.db.prepare(`
+            INSERT INTO datasets (dataset_id, dataset_name, dataset_directory, context_1, context_2)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(dataset_id) DO UPDATE SET
+                dataset_name = excluded.dataset_name,
+                dataset_directory = excluded.dataset_directory,
+                context_1 = excluded.context_1,
+                context_2 = excluded.context_2
+        `);
+        return stmt.run(datasetId, datasetName, datasetDirectory, context1 || null, context2 || null);
+    }
+
     // =====================================================
     // COMPATIBILITY METHODS
     // =====================================================
@@ -197,25 +239,32 @@ export class ProfilingRepository {
     // =====================================================
 
     createExecution(versionId, datasetId, profileSignature) {
+        const executionId = randomUUID();
         const stmt = this.db.prepare(`
-            INSERT INTO execution_profiles (version_id, dataset_id, profile_signature, status, started_at)
-            VALUES (?, ?, ?, 'RUNNING', CURRENT_TIMESTAMP)
+            INSERT INTO execution_profiles (execution_id, version_id, dataset_id, profile_signature, status, started_at)
+            VALUES (?, ?, ?, ?, 'RUNNING', CURRENT_TIMESTAMP)
         `);
-        const info = stmt.run(versionId, datasetId, profileSignature);
-        return info.lastInsertRowid;
+        stmt.run(executionId, versionId, datasetId, profileSignature);
+        return executionId;
     }
 
     createExecutionsBulk(executions) {
         const stmt = this.db.prepare(`
-            INSERT INTO execution_profiles (version_id, dataset_id, profile_signature, status, started_at)
-            VALUES (?, ?, ?, 'RUNNING', CURRENT_TIMESTAMP)
+            INSERT INTO execution_profiles (execution_id, version_id, dataset_id, profile_signature, status, started_at)
+            VALUES (?, ?, ?, ?, 'RUNNING', CURRENT_TIMESTAMP)
         `);
         return this.#transaction(() => {
             return executions.map(ex => {
-                const info = stmt.run(ex.versionId, ex.datasetId, ex.profileSignature);
-                return info.lastInsertRowid;
+                const executionId = randomUUID();
+                stmt.run(executionId, ex.versionId, ex.datasetId, ex.profileSignature);
+                return executionId;
             });
         });
+    }
+
+    getExecutionProfile(executionId) {
+        const stmt = this.db.prepare(`SELECT * FROM execution_profiles WHERE execution_id = ?`);
+        return stmt.get(executionId);
     }
 
     getExecution(executionId) {
@@ -228,9 +277,35 @@ export class ProfilingRepository {
         return stmt.all();
     }
 
+    getCompletedExecution(versionId, datasetId) {
+        const stmt = this.db.prepare(`
+            SELECT * FROM execution_profiles 
+            WHERE version_id = ? AND dataset_id = ? AND status = 'COMPLETED'
+            ORDER BY completed_at DESC LIMIT 1
+        `);
+        return stmt.get(versionId, datasetId);
+    }
+
     updateExecutionStatus(executionId, status) {
-        const stmt = this.db.prepare(`UPDATE execution_profiles SET status = ? WHERE execution_id = ?`);
+        const stmt = this.db.prepare(`
+            UPDATE execution_profiles SET status = ? WHERE execution_id = ?
+        `);
         return stmt.run(status, executionId);
+    }
+
+    addProfilingJob(jobId, versionId, datasetId, traceabilityKey, outputLocation, forceReprofile) {
+        const stmt = this.db.prepare(`
+            INSERT INTO profiling_jobs (job_id, version_id, dataset_id, traceability_key, output_location, force_reprofile, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
+        `);
+        return stmt.run(jobId, versionId, datasetId, traceabilityKey, outputLocation || null, forceReprofile ? 1 : 0);
+    }
+
+    updateProfilingJobStatus(jobId, status) {
+        const stmt = this.db.prepare(`
+            UPDATE profiling_jobs SET status = ? WHERE job_id = ?
+        `);
+        return stmt.run(status, jobId);
     }
 
     completeExecution(executionId) {
@@ -329,6 +404,8 @@ export class ProfilingRepository {
         const stmt = this.db.prepare(`DELETE FROM analysis_results WHERE analysis_id = ?`);
         return stmt.run(analysisId);
     }
+
+
 
     // =====================================================
     // PLANNER LOOKUP METHODS

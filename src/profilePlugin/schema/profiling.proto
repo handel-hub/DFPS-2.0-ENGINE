@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package profiling;
+
+service ProfilingService {
+  rpc ExecuteProfileJob (ProfileRequest) returns (ProfileResponse) {}
+}
+
+message ProfileRequest {
+  repeated string pluginprofiles = 1;      // e.g. ["pluginId@version"]
+  repeated string datasets = 2;            // e.g. ["datasetId1", "datasetId2"]
+  string output_location = 3;              // directory path for the output JSON
+  bool force_reprofile = 4;                // flag to skip completion checks and redo
+}
+
+message JobResponse {
+  string job_id = 1;
+  string pluginprofile = 2;
+  string dataset = 3;
+  string status = 4;                       // "COMPLETED", "SKIPPED", "FAILED"
+  string execution_id = 5;                 // Resulting execution ID if completed
+  string traceability_key = 6;             // e.g. "pluginId_datasetId"
+}
+
+message ProfileResponse {
+  repeated JobResponse jobs = 1;
+}

@@ -19,6 +19,8 @@ class StateInterface {
     #Register;
     #Memory;
     #Time;
+    #Wal;
+    #Batcher;
 
     constructor(opts = {}) {
         this.#Cpu = opts.Cpu || new CpuProfileManager();
@@ -27,6 +29,7 @@ class StateInterface {
         this.#Memory = opts.Memory || new MemoryProfileStore();
         this.#Time = opts.Time || new TimeProfileManager();
 
+        const workerId = opts.workerId || 'local-coordinator';
         this.#Wal = opts.Wal || new Wal({ walDir: './wal', workerId });
 
         const fetchBatchFn = (lastAckedSeq, batchOptions) => {
@@ -36,7 +39,7 @@ class StateInterface {
         this.#Batcher = opts.Batcher || new WorkerBatcher(this.#Wal, fetchBatchFn, {
             workerId: workerId,
             storageMode: 'both',
-            // ... grpc hooks go here
+            grpcSendFn: opts.grpcSendFn || (async () => ({ acceptedUpTo: Date.now() }))
         });
 
         // configuration knobs (small, local defaults)
@@ -422,8 +425,52 @@ class StateInterface {
         };
     }
 
-    iSTaskRunning(taskId){
-        this.#Register.getTask(taskId)
+    getActiveTaskCount() {
+        if (this.#Register && typeof this.#Register.getActiveTaskCount === 'function') {
+            return this.#Register.getActiveTaskCount();
+        }
+        return this.#Register?.activeTasks ? this.#Register.activeTasks.size : 0;
+    }
+
+    markTaskDispatched(taskId, pluginId) {
+        if (typeof this.#Register.markTaskRunning === 'function') {
+            this.#Register.markTaskRunning(taskId, pluginId);
+        } else if (typeof this.#Register.updateRuntimePhase === 'function') {
+            this.#Register.updateRuntimePhase(taskId, 'DISPATCHED');
+        }
+    }
+
+    updateRuntimePhase(taskId, phase, metadata = {}) {
+        if (typeof this.#Register.updateRuntimePhase === 'function') {
+            this.#Register.updateRuntimePhase(taskId, phase, metadata);
+        }
+    }
+
+    markTaskCompleted(taskId, payload = {}) {
+        if (typeof this.#Register.markTaskCompleted === 'function') {
+            this.#Register.markTaskCompleted(taskId, payload);
+        }
+    }
+
+    markTaskFailed(taskId, error) {
+        if (typeof this.#Register.markTaskFailed === 'function') {
+            this.#Register.markTaskFailed(taskId, error);
+        }
+    }
+
+    updateProfilesSynchronous(taskId, metrics = {}) {
+        if (metrics.cpu && typeof this.#Cpu.update === 'function') {
+            this.#Cpu.update(taskId, metrics.cpu);
+        }
+        if (metrics.memory && typeof this.#Memory.update === 'function') {
+            this.#Memory.update(taskId, metrics.memory);
+        }
+        if (metrics.time && typeof this.#Time.update === 'function') {
+            this.#Time.update(taskId, metrics.time);
+        }
+        if (metrics.io && typeof this.#Io.update === 'function') {
+            this.#Io.update(taskId, metrics.io);
+        }
     }
 
 

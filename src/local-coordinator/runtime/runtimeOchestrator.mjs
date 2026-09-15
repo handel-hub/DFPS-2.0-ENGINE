@@ -4,6 +4,7 @@ import { DAGBuilder } from "../core/dag-builder/index.mjs";
 import { ProcessPoolOrchestrator } from "../core/pool-manager/index.mjs";
 import { extract } from "../utils/index.mjs";
 import { EventEmitter } from "node:events";
+import os from "node:os";
 import { 
     Wal,
     WorkerBatcher 
@@ -26,22 +27,26 @@ class RuntimeOchestrator extends EventEmitter {
 
 	#sequence
 	#dagPoint
+	#errorLog
+
 	constructor(config = {}) {
+		super();
+		const workerId = config.workerId || 'local-coordinator';
 
 		this.schedulingNum = config.schedulingNum ?? 10
 
 		this.#maxDag = config.maxDag ?? 1000; //value is a guesse one refinement will be done after tests 
-		this.#State = new StateInterface();
+		this.#State = config.State || new StateInterface();
 		this.#extract = extract;
 		this.#Queue = new ExternalJobQueue();
 		this.#Dag = new DAGBuilder();
-		this.#Pool = new ProcessPoolOrchestrator();
+		this.#Pool = new ProcessPoolOrchestrator({}, () => {});
 		
 		this.#Wal = new Wal({ walDir: './error', workerId })
-		this.#Batcher = opts.Batcher || new WorkerBatcher(this.#Wal, this.fetchBatchFn, {
+		this.#Batcher = config.Batcher || new WorkerBatcher(this.#Wal, this.fetchBatchFn.bind(this), {
 				workerId: workerId,
 				storageMode: 'both',
-				// ... grpc hooks go here
+                grpcSendFn: config.grpcSendFn || (async () => ({ acceptedUpTo: Date.now() }))
 			});	
 
 		
@@ -53,10 +58,9 @@ class RuntimeOchestrator extends EventEmitter {
 
 		this.#execDagMap = new Map()
 		this.failed = []
-		this.#execDagMap.set('queue',Array(Number(config.workerSlot ?? Math.max(1, os.cpus().length - 1))))
 
 		this.on('jobsAvailable',(data)=>{
-			#handleJob(data)
+			this.#handleJob(data)
 		})
 	}
 	    // -------------------------
@@ -69,11 +73,11 @@ class RuntimeOchestrator extends EventEmitter {
         const ev = {
             type,
             jobId,
-            error,
+            error: payload,
             timestamp: this.#now(),
             sequenceId: this.#nextSeq()
         };
-        this.errorLog.push(ev);
+        this.#errorLog.push(ev);
         return ev;
     }
 
@@ -137,7 +141,10 @@ class RuntimeOchestrator extends EventEmitter {
 			
 			const filteredTask = this.scan(newTask);
 			filteredTask.forEach((task) => {
-				this.#execDagMap.set(task.taskId, task);
+				const id = task.taskId || task.task_id;
+				if (id) {
+					this.#execDagMap.set(id, task);
+				}
 			});
 
 			this.#toExecDag = this.#toExecDag.slice(addExec);
@@ -152,5 +159,22 @@ class RuntimeOchestrator extends EventEmitter {
 		return tasks.filter(task => !this.failed.includes(task.jobId));
 	}
 
-
+	requestTasks(needed) {
+		const tasks = [];
+		const keys = Array.from(this.#execDagMap.keys()).slice(0, needed);
+		for (const key of keys) {
+			const rawTask = this.#execDagMap.get(key);
+			tasks.push({
+				taskId: rawTask.task_id,
+				pluginId: rawTask.plugin_id,
+				filePath: rawTask.file_path, // Could be extracted if needed
+				payload: rawTask,
+				ignoreMemoryCheck: rawTask.ignoreMemoryCheck || rawTask.ignore_memory_check || false
+			});
+			this.#execDagMap.delete(key);
+		}
+		return tasks;
+	}
 }
+
+export { RuntimeOchestrator };

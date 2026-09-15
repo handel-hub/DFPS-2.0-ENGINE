@@ -18,10 +18,10 @@ export class DatasetRegistryMap {
         if (typeof key === 'object' && key !== null) this.deepFreeze(key);
         if (typeof value === 'object' && value !== null) this.deepFreeze(value);
       }
-      Object.freeze(obj);
       obj.set = function() { throw new Error("Cannot mutate frozen Map"); };
       obj.delete = function() { throw new Error("Cannot mutate frozen Map"); };
       obj.clear = function() { throw new Error("Cannot mutate frozen Map"); };
+      Object.freeze(obj);
       return obj;
     }
 

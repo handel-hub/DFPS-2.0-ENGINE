@@ -280,3 +280,23 @@ CREATE TABLE plugin_predictive_artifacts (
 -- Guarantees the Planner Engine only ever finds ONE active champion per version
 CREATE UNIQUE INDEX idx_active_champion_artifact 
 ON plugin_predictive_artifacts(version_id) WHERE is_active = 1;
+
+-- =====================================================
+-- PROFILING JOBS (gRPC & automated tracking)
+-- =====================================================
+
+CREATE TABLE profiling_jobs (
+    job_id TEXT PRIMARY KEY,
+    version_id TEXT NOT NULL,
+    dataset_id TEXT NOT NULL,
+    traceability_key TEXT NOT NULL,
+    output_location TEXT,
+    force_reprofile INTEGER DEFAULT 0 CHECK(force_reprofile IN (0, 1)),
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED')),
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(version_id) REFERENCES plugin_versions(version_id) ON DELETE CASCADE,
+    FOREIGN KEY(dataset_id) REFERENCES datasets(dataset_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX idx_profiling_jobs_status ON profiling_jobs(status);
+CREATE INDEX idx_profiling_jobs_traceability ON profiling_jobs(traceability_key);

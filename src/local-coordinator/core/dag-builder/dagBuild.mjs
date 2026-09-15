@@ -2,8 +2,8 @@
 'use strict';
 
 import Ajv from 'ajv';
-import {jobSchema} from '../schemas/job.schema.json' assert { type: 'json' };
-import {fullContextSchema} from '../schemas/fullContext.schema.json' assert { type: 'json' };
+import jobSchema from '../schemas/job.schema.json' with { type: 'json' };
+import fullContextSchema from '../schemas/fullContext.schema.json' with { type: 'json' };
 
 const ajv = new Ajv({ allErrors: true, useDefaults: true, strict: false });
 const validateJob = ajv.compile(jobSchema);
@@ -82,6 +82,7 @@ class TaskNode {
         this.deadlineMs = deadlineMs;
         this.retryable = retryable;
         this.maxRetries = maxRetries;
+        this.ignoreMemoryCheck = false;
     }
 }
 
@@ -109,7 +110,7 @@ export class DAGBuilder {
      * @throws {DAGValidationError} If the resulting DAG is invalid (e.g., missing dependencies).
      * @throws {CostingError} If resource requirements exceed node capabilities.
      */
-    buildBatch(jobs, nodeConfig, fullContext) {
+    buildBatch(jobs, nodeConfig, fullContext, opts = {}) {
         // Validate inputs
         if (!Array.isArray(jobs)) throw new TypeError('jobs must be an array');
         if (!(nodeConfig instanceof NodeConfig)) throw new TypeError('nodeConfig must be NodeConfig');
@@ -147,8 +148,8 @@ export class DAGBuilder {
         // Build nodes
         const allNodes = [];
         for (const job of jobs) {
-        const nodes = this.#buildGraphForJob(job, ctxMap);
-        allNodes.push(...nodes);
+            const nodes = this.#buildGraphForJob(job, ctxMap, opts);
+            allNodes.push(...nodes);
         }
 
         // Cost nodes and produce tasks
@@ -178,7 +179,7 @@ export class DAGBuilder {
         return tasks;
     }
 
-    #buildGraphForJob(job, ctxMap) {
+    #buildGraphForJob(job, ctxMap, opts = {}) {
         const stages = job.pipeline.stages;
         const stageToTask = {};
         for (const s of stages) stageToTask[s.stageId] = `${job.jobId}::${s.stageId}`;
@@ -217,7 +218,7 @@ export class DAGBuilder {
         const fileType = ctx.extension ?? null;
         const pipelineId = job.pipelineId ?? job.pipeline_id ?? job.pipeline?.id ?? null;
         const jobScore = Number(job.calculatedScore ?? job.calculated_score ?? 0);
-        nodes.push(new TaskNode({
+        const node = new TaskNode({
             taskId: tid, jobId: job.jobId, pluginId: s.pluginId, pipelineId,
             fileType, sizeBytes, jobScore, dependsOn: taskDepends[tid] || [], children: childrenMap.get(tid) || [],
             depth: depths[tid] ?? 0, maxDepth, ctxEntry: ctx,
@@ -229,7 +230,9 @@ export class DAGBuilder {
             deadlineMs:         s.deadlineMs ?? null,
             retryable:          s.retryable ?? true,
             maxRetries:         s.maxRetries ?? 3,
-        }));
+        });
+        node.ignoreMemoryCheck = opts.ignoreMemoryCheck || job.ignoreMemoryCheck || false;
+        nodes.push(node);
         }
         return nodes;
     }
@@ -323,7 +326,8 @@ export class DAGBuilder {
         estimated_output_mb: Number.isFinite(Number(ctx.estimatedOutputMb)) ? Number(ctx.estimatedOutputMb) : null,
         // scheduling
         job_score: node.jobScore,
-        pos_weight,
+        pos_weight: posWeight,
+        ignoreMemoryCheck: node.ignoreMemoryCheck,
         // scheduling semantics
         task_type: node.taskType,
         allowed_worker_types: node.allowedWorkerTypes,
@@ -332,13 +336,13 @@ export class DAGBuilder {
         // dag
         depends_on: [...node.dependsOn],
         children: [...node.children],
-        plugin_group,
+        plugin_group: node.pluginId,
         diagnostics: {
             source: ctx.source ?? 'fullContext',
             schema_version: ctx.schemaVersion ?? null,
             cpu_profile: ctx.cpu ?? null,
             mem_mB: ramMb,
-            duration_ms
+            duration_ms: durationMs
         }
         };
     }
